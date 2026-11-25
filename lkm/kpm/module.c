@@ -21,6 +21,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/rculist.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -97,7 +98,7 @@ static void kp_clear_bti_gp(unsigned long base, unsigned long size)
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
 		if (pud_sect(*pud))
-			continue; /* huge page, skip — KPM pages are 4K */
+			continue; /* huge page, skip - KPM pages are 4K */
 		pmd = pmd_offset(pud, addr);
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
@@ -615,6 +616,14 @@ static int elf_header_check(struct kp_load_info *info)
 struct kp_module modules = { 0 };
 static spinlock_t module_lock;
 
+/* Load a KPM only up to the point where its init would run, then stop. See the
+ * dry-run gate in kp_load_module(). Read-only at runtime: flipping it mid-load
+ * would race the check. */
+static bool kp_kpm_dry_run;
+module_param_named(kpm_dry_run, kp_kpm_dry_run, bool, 0444);
+MODULE_PARM_DESC(kpm_dry_run,
+		 "1 = load KPM images but never execute their init (diagnostic; default 0)");
+
 /* Set while a KPM's init runs: during that window the module is not yet on
  * modules.list, but its image must already be shielded from the Qualcomm
  * find_check_fn() panic / BTI faults (the KPM may iterate kallsyms from init).
@@ -815,6 +824,39 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 		 mod->info.name, mod->init, mod->start, mod->size);
 
 	WRITE_ONCE(kp_loading_mod, mod);
+
+	/*
+	 * Dry-run gate.
+	 *
+	 * Loading a KPM has hard-rebooted GKI 6.6 every time: the KPM's init runs
+	 * successfully as far as we can tell, then the device dies inside the
+	 * inline-hook engine's trampolines, and this vendor kernel has no ramoops
+	 * to capture the trace. Without a crash log each attempt costs a reboot
+	 * and teaches nothing.
+	 *
+	 * With kpm_dry_run set, everything up to the point of execution still
+	 * runs - ELF check, section layout, executable allocation, symbol
+	 * resolution against the live kernel, relocations, set_memory_x, BTI/GP
+	 * clearing, icache flush - and then we stop before kp_call_init. That is
+	 * precisely the half that has never been validated on 6.6, and it is the
+	 * half that fails without touching any hardware. The module is loaded
+	 * into the KPM table so it can be inspected and unloaded, but its init
+	 * never executes, so nothing can fault.
+	 *
+	 * Set it from userspace to find out whether a KPM is loadable *before*
+	 * risking the reboot: insmod kernelpatch.ko kpm_dry_run=1
+	 */
+	if (READ_ONCE(kp_kpm_dry_run)) {
+		logkw("KPM [%s] dry run: init NOT executed (image=%px size=%u)\n",
+		      mod->info.name, mod->start, mod->size);
+		mod->info.flags = 0;
+		list_add_tail(&mod->list, &modules.list);
+		pr_emerg(KPLKM_TAG ": KPM [%s] dry run complete, init skipped\n",
+			 mod->info.name);
+		WRITE_ONCE(kp_loading_mod, NULL);
+		goto out;
+	}
+
 	pr_emerg(KPLKM_TAG ": KPM [%s] call init fn=%px (*fn)=%px args=%px args0='%s' event='%s'\n",
 		 mod->info.name, mod->init,
 		 mod->init ? *(mod_initcall_t *)mod->init : 0,
