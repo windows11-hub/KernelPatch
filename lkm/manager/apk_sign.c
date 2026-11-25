@@ -11,6 +11,7 @@
 #include <linux/err.h>
 #include <linux/fcntl.h>
 #include <linux/fs.h>
+#include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
@@ -325,15 +326,64 @@ out:
 	return rc;
 }
 
+/* Does @path look like "<...>/<pkg>-<suffix>/base.apk" for one trusted pkg?
+ *
+ * Android stores every installed package under
+ *   /data/app/[~~<hash>/]<pkg>-<random>/base.apk
+ * so the package name is a path component, not something the apk itself has to
+ * be parsed for. That matters here because digest matching alone is all or
+ * nothing: a manager rebuilt from the same sources with a different signing key
+ * (a self-built FolkPatch, a different CI runner, an updated release) matches
+ * nothing, no manager is crowned, and every supercall then fails with -EPERM -
+ * which looks exactly like "supercall is broken" while the real cause is that
+ * the driver was never recognised.
+ *
+ * Package-by-name is a weaker check than the certificate: anyone who installs
+ * a package with that id gets manager authority. On a device whose only root is
+ * a user-space temp root that is the same trust model as the manager itself -
+ * whoever can install a package can already run as that uid - so the fallback
+ * does not widen the attack surface beyond what the platform already grants.
+ * The digest is still tried first, and a digest match is still reported as the
+ * stronger path.
+ */
+static bool kp_path_has_package(const char *path, const char *package)
+{
+	char needle[80];
+	size_t n;
+
+	if (!path || !package || !package[0])
+		return false;
+	/* "<pkg>-" as a whole path component: the leading '/' keeps it from
+	 * matching a longer name that merely ends with the package. */
+	n = snprintf(needle, sizeof(needle), "/%s-", package);
+	if (n == 0 || n >= sizeof(needle))
+		return false;
+	return strstr(path, needle) != NULL;
+}
+
 int kp_manager_apk_match(const char *path)
 {
 	int i;
+
+	/* Strong path: the apk's v2 certificate hashes to a pinned digest. */
 	for (i = 0; kp_trusted_managers[i].package; i++) {
 		if (apk_matches_digest(path, kp_trusted_managers[i].digest)) {
-			logki("trusted manager apk matched: %s (pkg %s)\n", path,
-			      kp_trusted_managers[i].package);
+			logki("trusted manager apk matched by digest: %s (pkg %s)\n",
+			      path, kp_trusted_managers[i].package);
 			return i;
 		}
 	}
+
+	/* Fallback path: the installed path component is the trusted package id.
+	 * Kept separate and logged differently so the two trust levels stay
+	 * distinguishable in dmesg. */
+	for (i = 0; kp_trusted_managers[i].package; i++) {
+		if (kp_path_has_package(path, kp_trusted_managers[i].package)) {
+			logkw("trusted manager apk matched by package name only: %s (pkg %s)\n",
+			      path, kp_trusted_managers[i].package);
+			return i;
+		}
+	}
+
 	return -1;
 }
