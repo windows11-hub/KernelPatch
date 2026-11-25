@@ -305,21 +305,35 @@ int kp_sucompat_hook_init(void)
 		return rc;
 	logki("sucompat: execve hook installed (su path %s -> %s)\n", kp_su_get_path(), KP_SH_PATH);
 
-	/* Path-probe redirect. The execve hook above only sees programs that are
-	 * actually exec'd; a loader that opens the su path with openat() and then
-	 * feeds the fd to fexecve(), or a stat() probe asking "does su exist",
-	 * never reaches it. getname_flags() is the single point every path-based
-	 * lookup goes through, so rewriting the name here covers both.
-	 *
-	 * This used to be disabled because the trampoline faulted on GKI 6.6 -
-	 * the hook pages were executable but still had the GP bit set, so BTI
-	 * rejected the BR into them. hook_runtime.c now clears PXN/UXN/GP, which
-	 * is what makes this safe to turn back on. */
+#if 0 /* Do NOT enable. Measured on this device, not guessed.
+       *
+       * getname_flags() is KCFI-typed on GKI 6.6. Routing it through the LKM
+       * hook engine lands in _transit4, which contains a KCFI type-check BRK
+       * (#0x8228). The check fails, cfi_handler runs, it calls
+       * report_cfi_failure(), which is itself hooked by secpass.c, which calls
+       * back into the same stub -> unbounded recursion -> "kernel panic -
+       * not syncing: kernel stack overflow" on the first openat() after load.
+       *
+       * The observed trace, 70s after insmod, opening a file:
+       *   __replace_report_cfi_failure+0x68 [kernelpatch]
+       *   cfi_handler -> brk_handler -> do_debug_exception -> el1_dbg
+       *   _transit4+0xe4/0x188 [kernelpatch]
+       *   getname+0x18/0x28 -> do_sys_openat2 -> susfs_opath_openat
+       *
+       * Clearing PXN/UXN/GP (hook_runtime.c) fixes BTI, but BTI and KCFI are
+       * two different checks: GP gates the branch, the type hash gates the
+       * call. This hook trips the second one. The execve hook above carries su
+       * on its own and has run clean.
+       *
+       * Re-enabling needs the hook engine to emit transit stubs that are not
+       * instrumented (asm, or __nocfi on every _transit*) - a build-system
+       * change, not a flag flip. */
 	rc = kp_hook_getname_flags();
 	if (rc)
 		logkw("sucompat: getname_flags hook failed: %d\n", rc);
 	else
 		logki("sucompat: getname_flags hook installed\n");
+#endif
 	return 0;
 }
 
