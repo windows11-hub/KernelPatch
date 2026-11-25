@@ -31,10 +31,29 @@
  * these four functions. It has to be set here rather than in hook.c so the GKI
  * build of that file stays byte-identical to upstream.
  */
-/* no_sanitize names must match what the kernel actually enables: -fsanitize=kcfi.
- * The string "cfi" refers to the legacy sanitizer and is accepted by the
- * compiler but matches nothing when kcfi is on, so both spellings are listed. */
-#define KP_TRANSIT_ATTR __attribute__((no_sanitize("cfi", "kcfi")))
+/* KCFI exemption for the transit stubs.
+ *
+ * This MUST come from the build system, not from a literal attribute here.
+ * no_sanitize("kcfi") is only understood by clang 14+, and on older compilers
+ * -Wunknown-sanitizers promotes it to a hard error (the build runs -Werror).
+ * no_sanitize("cfi") is universally accepted but names the legacy sanitizer,
+ * which the kernel never enables - it matches nothing.
+ *
+ * So Kbuild probes the compiler once and defines KP_KCFI_ATTR to either
+ * __attribute__((no_sanitize("kcfi"))) or nothing. See lkm/Kbuild.
+ * The object-level -fno-sanitize=kcfi flag there is the primary fix; this
+ * attribute is belt-and-braces for the case where the object flag is dropped. */
+#ifndef KP_HAVE_KCFI
+#define KP_HAVE_KCFI 0
+#endif
+
+#if KP_HAVE_KCFI
+#define KP_KCFI_ATTR __attribute__((no_sanitize("kcfi")))
+#else
+#define KP_KCFI_ATTR
+#endif
+
+#define KP_TRANSIT_ATTR KP_KCFI_ATTR
 
 /* The original kpimg linker script provides _transit*_end and copies each
  * transit function into hook memory. Linux modules have no such linker
