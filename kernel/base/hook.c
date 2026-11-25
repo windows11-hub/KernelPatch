@@ -10,6 +10,7 @@
 #include <hotpatch.h>
 #include <kpmalloc.h>
 #include "hmem.h"
+#include <kp_call.h>
 
 #define bits32(n, high, low) ((uint32_t)((n) << (31u - (high))) >> (31u - (high) + (low)))
 #define bit(n, st) (((n) >> (st)) & 1)
@@ -373,17 +374,19 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
     fargs.chain = hook_chain;
     for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain0_callback func = hook_chain->befores[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->befores[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     if (!fargs.skip_origin) {
-        transit0_func_t origin_func = (transit0_func_t)hook_chain->hook.relo_addr;
-        fargs.ret = origin_func();
+        /* relo_addr is relocated instruction bytes: calling it as a C function
+         * pointer makes the compiler emit a KCFI hash check that cannot pass.
+         * kp_call0 issues a plain blr instead. See kp_call.h. */
+        fargs.ret = kp_call0((void *)hook_chain->hook.relo_addr);
     }
     for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain0_callback func = hook_chain->afters[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->afters[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     return fargs.ret;
 }
@@ -408,17 +411,17 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
     fargs.chain = hook_chain;
     for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain4_callback func = hook_chain->befores[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->befores[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     if (!fargs.skip_origin) {
-        transit4_func_t origin_func = (transit4_func_t)hook_chain->hook.relo_addr;
-        fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3);
+        fargs.ret = kp_call4((void *)hook_chain->hook.relo_addr, fargs.arg0, fargs.arg1,
+                             fargs.arg2, fargs.arg3);
     }
     for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain4_callback func = hook_chain->afters[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->afters[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     return fargs.ret;
 }
@@ -449,18 +452,18 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
     fargs.chain = hook_chain;
     for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain8_callback func = hook_chain->befores[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->befores[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     if (!fargs.skip_origin) {
-        transit8_func_t origin_func = (transit8_func_t)hook_chain->hook.relo_addr;
-        fargs.ret =
-            origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6, fargs.arg7);
+        fargs.ret = kp_call8((void *)hook_chain->hook.relo_addr, fargs.arg0, fargs.arg1,
+                             fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5,
+                             fargs.arg6, fargs.arg7);
     }
     for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain8_callback func = hook_chain->afters[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->afters[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     return fargs.ret;
 }
@@ -496,18 +499,18 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t 
     fargs.chain = hook_chain;
     for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain12_callback func = hook_chain->befores[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->befores[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     if (!fargs.skip_origin) {
-        transit12_func_t origin_func = (transit12_func_t)hook_chain->hook.relo_addr;
-        fargs.ret = origin_func(fargs.arg0, fargs.arg1, fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6,
-                                fargs.arg7, fargs.arg8, fargs.arg9, fargs.arg10, fargs.arg11);
+        fargs.ret = kp_call12((void *)hook_chain->hook.relo_addr, fargs.arg0, fargs.arg1,
+                              fargs.arg2, fargs.arg3, fargs.arg4, fargs.arg5, fargs.arg6,
+                              fargs.arg7, fargs.arg8, fargs.arg9, fargs.arg10, fargs.arg11);
     }
     for (int32_t i = hook_chain->chain_items_max - 1; i >= 0; i--) {
         if (hook_chain->states[i] != CHAIN_ITEM_STATE_READY) continue;
-        hook_chain12_callback func = hook_chain->afters[i];
-        if (func) func(&fargs, hook_chain->udata[i]);
+        unsigned long func = (unsigned long)hook_chain->afters[i];
+        if (func) kp_call2((void *)func, (unsigned long)&fargs, (unsigned long)hook_chain->udata[i]);
     }
     return fargs.ret;
 }
