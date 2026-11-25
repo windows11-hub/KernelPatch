@@ -17,6 +17,7 @@
 #include "scdefs.h"
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 #include "../infra/syscall_table.h"
 #include "../manager/manager.h"
 #include "sucompat.h"
@@ -47,7 +48,7 @@ static long kp_supercall_handler(const struct pt_regs *regs)
 		logkd("supercall: uid %u not authorized (manager?%d allow?%d)\n", uid,
 		      kp_is_manager_uid(uid), kp_is_su_allow_uid(uid));
 		if (kp_orig_truncate)
-			return kp_orig_truncate(regs);
+			return (long)kp_call1((void *)kp_orig_truncate, (unsigned long)regs);
 		return -ENOSYS;
 	}
 
@@ -55,7 +56,7 @@ static long kp_supercall_handler(const struct pt_regs *regs)
 	long cmd = ver_xx_cmd & 0xFFFF;
 	if (cmd < SUPERCALL_HELLO || cmd > SUPERCALL_MAX) {
 		logkd("bad supercall cmd 0x%lx\n", cmd);
-		return kp_orig_truncate ? kp_orig_truncate(regs) : -EINVAL;
+		return kp_orig_truncate ? (long)kp_call1((void *)kp_orig_truncate, (unsigned long)regs) : -EINVAL;
 	}
 
 	if (!manager && !kp_supercall_allowed_for_su(cmd))
