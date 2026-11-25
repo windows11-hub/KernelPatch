@@ -21,6 +21,8 @@
 #include <scdefs.h>
 #include <hook.h>
 
+#include "../include/kp_call.h"
+
 #include "../include/kp_lkm.h"
 #include "../infra/symbol_resolver.h"
 #include "../manager/manager.h"
@@ -241,8 +243,15 @@ static int kp_avc_denied_hook(void *ssid, void *tsid, void *tclass, void *reques
 	}
 	if (!kp_avc_denied_orig)
 		return -EACCES;
-	return kp_avc_denied_orig(ssid, tsid, tclass, requested, driver, xperm,
-				  flags, avd);
+	/* Through kp_call8, not a C call: kp_avc_denied_orig is hook()'s
+	 * relocated original, i.e. instruction bytes with no KCFI type hash in
+	 * front of them. A C-level call would load the hash, fail, and panic
+	 * with "Oops - CFI" on the first stat() of the boot. See kp_call.h. */
+	return (int)kp_call8((void *)kp_avc_denied_orig,
+			     (unsigned long)ssid, (unsigned long)tsid,
+			     (unsigned long)tclass, (unsigned long)requested,
+			     (unsigned long)driver, (unsigned long)xperm,
+			     (unsigned long)flags, (unsigned long)avd);
 }
 
 __attribute__((no_sanitize("cfi")))
@@ -255,8 +264,11 @@ static int kp_slow_avc_audit_hook(void *ssid, void *tsid, void *tclass, void *re
 		return 0;
 	if (!kp_slow_avc_audit_orig)
 		return (int)(long)result;
-	return kp_slow_avc_audit_orig(ssid, tsid, tclass, requested, audited,
-				      denied, result, a);
+	return (int)kp_call8((void *)kp_slow_avc_audit_orig,
+			     (unsigned long)ssid, (unsigned long)tsid,
+			     (unsigned long)tclass, (unsigned long)requested,
+			     (unsigned long)audited, (unsigned long)denied,
+			     (unsigned long)result, (unsigned long)a);
 }
 
 int kp_selinux_bypass_init(void)
