@@ -94,9 +94,21 @@ ccflags-y += -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
 # android12-5.10 matrix entry builds with clang-12, where passing it is a hard
 # error ("unsupported argument 'kcfi'"), so probe the compiler once at parse
 # time and only add the flag when it is genuinely understood.
-KP_KCFI_FLAG := $(shell echo 'int kp_cfi_probe(void){return 0;}' | \
-	$(CC) -fsanitize=kcfi -x c -c - -o /dev/null 2>/dev/null && echo -fno-sanitize=kcfi)
-$(info -- KP kcfi flag: $(if $(KP_KCFI_FLAG),$(KP_KCFI_FLAG),none (compiler too old)))
+# Probe once: does this compiler know the kcfi sanitizer at all?
+kp_kcfi_probe := $(shell echo 'int kp_cfi_probe(void){return 0;}' | \
+	$(CC) -fsanitize=kcfi -x c -c - -o /dev/null 2>/dev/null && echo yes)
+ifeq ($(kp_kcfi_probe),yes)
+KP_KCFI_FLAG := -fno-sanitize=kcfi
+KP_HAVE_KCFI := 1
+else
+KP_KCFI_FLAG :=
+KP_HAVE_KCFI := 0
+endif
+# Plain integer, never the attribute text itself: -D'__attribute__((no_sanitize("kcfi")))'
+# cannot survive shell quoting. The header expands the attribute only when this
+# is 1, i.e. only when the compiler is known to understand the name.
+ccflags-y += -DKP_HAVE_KCFI=$(KP_HAVE_KCFI)
+$(info -- KP kcfi: $(if $(filter 1,$(KP_HAVE_KCFI)),enabled,not supported by this compiler))
 
 CFLAGS_hook/hook_engine.o += -fno-sanitize=cfi $(KP_KCFI_FLAG)
 CFLAGS_hook/hook_engine.o += -fno-stack-protector -fno-jump-tables
