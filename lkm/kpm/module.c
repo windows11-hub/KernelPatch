@@ -33,6 +33,7 @@
 #include <asm/tlbflush.h>
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 
 #define SZ_128M 0x08000000
 
@@ -126,9 +127,9 @@ __attribute__((no_sanitize("cfi"), __noinline__))
 static void *kp_malloc_exec(unsigned long size)
 {
 	if (kp_module_alloc)
-		return kp_module_alloc(size);
+		return (void *)kp_call1((void *)kp_module_alloc, (unsigned long)size);
 	if (kp_execmem_alloc)
-		return kp_execmem_alloc(0 /* EXECMEM_MODULE_TEXT */, size);
+		return (void *)kp_call2((void *)kp_execmem_alloc, 0 /* EXECMEM_MODULE_TEXT */, (unsigned long)size);
 	return vmalloc(size);
 }
 
@@ -136,9 +137,9 @@ __attribute__((no_sanitize("cfi"), __noinline__))
 static void kp_free_exec(void *region)
 {
 	if (kp_module_memfree)
-		kp_module_memfree(region);
+		kp_call1((void *)kp_module_memfree, (unsigned long)region);
 	else if (kp_execmem_free)
-		kp_execmem_free(region);
+		kp_call1((void *)kp_execmem_free, (unsigned long)region);
 	else
 		vfree(region);
 }
@@ -157,44 +158,48 @@ __attribute__((no_sanitize("cfi")))
 static long kp_call_init(mod_initcall_t *fn, const char *args, const char *event,
 			 void __user *reserved)
 {
-	return (*fn)(args, event, reserved);
+	return (long)kp_call3((void *)fn, (unsigned long)args,
+			      (unsigned long)event, (unsigned long)reserved);
 }
 
 __attribute__((no_sanitize("cfi")))
 static long kp_call_exit(mod_exitcall_t *fn, void __user *reserved)
 {
-	return (*fn)(reserved);
+	return (long)kp_call1((void *)fn, (unsigned long)reserved);
 }
 
 __attribute__((no_sanitize("cfi")))
 static int kp_do_set_memory_x(unsigned long addr, int npages)
 {
-	return kp_set_memory_x(addr, npages);
+	return (int)kp_call2((void *)kp_set_memory_x, (unsigned long)addr, (unsigned long)npages);
 }
 
 __attribute__((no_sanitize("cfi")))
 static int kp_do_set_memory_nx(unsigned long addr, int npages)
 {
-	return kp_set_memory_nx(addr, npages);
+	return (int)kp_call2((void *)kp_set_memory_nx, (unsigned long)addr, (unsigned long)npages);
 }
 
 __attribute__((no_sanitize("cfi")))
 static long kp_call_ctl0(mod_ctl0call_t *fn, const char *args, char __user *out, int outlen)
 {
-	return (*fn)(args, out, outlen);
+	return (long)kp_call3((void *)fn, (unsigned long)args,
+			      (unsigned long)out, (unsigned long)outlen);
 }
 
 __attribute__((no_sanitize("cfi")))
 static long kp_call_ctl1(mod_ctl1call_t *fn, void *a1, void *a2, void *a3)
 {
-	return (*fn)(a1, a2, a3);
+	return (long)kp_call3((void *)fn, (unsigned long)a1,
+			      (unsigned long)a2, (unsigned long)a3);
 }
 
 __attribute__((no_sanitize("cfi")))
 static long kp_call_event(mod_eventcall_t *fn, const char *event, const char *args,
 			  void __user *reserved)
 {
-	return (*fn)(event, args, reserved);
+	return (long)kp_call3((void *)fn, (unsigned long)event,
+			      (unsigned long)args, (unsigned long)reserved);
 }
 
 static void set_load_error(struct kp_load_info *info, const char *message)
@@ -701,7 +706,7 @@ int kp_kpm_safe_kallsyms_on_each_symbol(kp_kallsyms_cb_t fn, void *data)
 		return -EOPNOTSUPP;
 
 	if (!kp_callback_tramp || !kp_kpm_cfi_allowed_addr((unsigned long)fn))
-		return kp_real_kallsyms_on_each_symbol(fn, data);
+		return (int)kp_call2((void *)kp_real_kallsyms_on_each_symbol, (unsigned long)fn, (unsigned long)data);
 
 	{
 		unsigned long flags;
@@ -725,7 +730,8 @@ int kp_kpm_safe_kallsyms_on_each_symbol(kp_kallsyms_cb_t fn, void *data)
 	}
 
 	{
-		int r = kp_real_kallsyms_on_each_symbol((kp_kallsyms_cb_t)((char *)kp_callback_tramp + 8), data);
+		int r = (int)kp_call2((void *)kp_real_kallsyms_on_each_symbol,
+			       (unsigned long)((char *)kp_callback_tramp + 8), (unsigned long)data);
 		pr_emerg(KPLKM_TAG ": kallsyms safe done rc=%d\n", r);
 		return r;
 	}
