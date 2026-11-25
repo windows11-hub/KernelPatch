@@ -5,6 +5,13 @@
  * Manager scan, mirroring KernelSU's throne_tracker flow but using the APatch
  * trusted-cert table. packages.list is plain text on all Android versions, so
  * it is the uid source; the APK cert check anchors trust.
+ *
+ * Multi-manager: the scan used to stop at the first base.apk that matched any
+ * trusted digest, which meant exactly one appid could ever be crowned. It now
+ * walks the whole tree and crowns every match, up to KP_MANAGER_MAX, so a
+ * manager plus a second trusted front-end can both hold manager authority.
+ * The first crowned appid still answers kp_manager_appid() so single-manager
+ * callers keep working.
  */
 #include "manager.h"
 #include "apk_sign.h"
@@ -42,21 +49,53 @@
 #define FILLDIR_STOP -EINVAL
 #endif
 
-static uid_t kp_manager_appid_value = KP_INVALID_APPID;
+static uid_t kp_manager_appids[KP_MANAGER_MAX];
+static int kp_manager_nappids;
 static struct work_struct kp_manager_scan_work;
+
+int kp_manager_count(void)
+{
+	return READ_ONCE(kp_manager_nappids);
+}
+
+uid_t kp_manager_appid_at(int index)
+{
+	if (index < 0 || index >= READ_ONCE(kp_manager_nappids))
+		return KP_INVALID_APPID;
+	return READ_ONCE(kp_manager_appids[index]);
+}
 
 uid_t kp_manager_appid(void)
 {
-	return READ_ONCE(kp_manager_appid_value);
+	if (!READ_ONCE(kp_manager_nappids))
+		return KP_INVALID_APPID;
+	return READ_ONCE(kp_manager_appids[0]);
+}
+
+static bool kp_manager_appid_known(uid_t uid)
+{
+	int i, n = READ_ONCE(kp_manager_nappids);
+
+	for (i = 0; i < n; i++) {
+		if (READ_ONCE(kp_manager_appids[i]) == uid)
+			return true;
+	}
+	return false;
 }
 
 bool kp_is_manager_uid(uid_t uid)
 {
-	uid_t appid = kp_manager_appid();
-	if (appid == KP_INVALID_APPID)
+	int i, n = READ_ONCE(kp_manager_nappids);
+
+	if (!n)
 		return false;
 	/* uid may include a user-id offset; compare the appid part. */
-	return (uid % 100000) == appid;
+	uid = uid % 100000;
+	for (i = 0; i < n; i++) {
+		if ((READ_ONCE(kp_manager_appids[i]) % 100000) == uid)
+			return true;
+	}
+	return false;
 }
 
 /* Parse /data/system/packages.list for @package and return its uid. With
@@ -65,6 +104,10 @@ bool kp_is_manager_uid(uid_t uid)
  * post-update content while packages.list is still the pre-update one. */
 static uid_t kp_lookup_package_uid(const char *package, int use_tmp)
 {
+	const char *path = use_tmp ? KP_PACKAGES_LIST_TMP : KP_PACKAGES_LIST;
+	struct file *fp;
+	loff_t fsize;
+
 	const char *path = use_tmp ? KP_PACKAGES_LIST_TMP : KP_PACKAGES_LIST;
 	struct file *fp;
 	loff_t fsize;
@@ -137,17 +180,39 @@ out_close:
 	return uid;
 }
 
-static void kp_crown_manager(int manager_idx, int use_tmp)
+/* Crown one more manager. Returns true when a new appid was recorded, false
+ * when it failed or was already known. Keeping this additive is what allows
+ * more than one manager: the old code overwrote a single scalar and the scan
+ * stopped at the first hit. */
+static bool kp_crown_manager(int manager_idx, int use_tmp)
 {
 	const char *pkg = kp_trusted_managers[manager_idx].package;
 	uid_t uid = kp_lookup_package_uid(pkg, use_tmp);
+	int n;
 
 	if (uid == KP_INVALID_APPID) {
 		logke("found manager apk for %s but no uid in packages.list\n", pkg);
-		return;
+		return false;
 	}
-	WRITE_ONCE(kp_manager_appid_value, uid);
-	logki("trusted manager crowned: %s uid=%u\n", pkg, uid);
+
+	n = READ_ONCE(kp_manager_nappids);
+	if (kp_manager_appid_known(uid)) {
+		logkfd("manager %s uid=%u already crowned\n", pkg, uid);
+		return false;
+	}
+	if (n >= KP_MANAGER_MAX) {
+		logkw("manager table full (%d), ignoring %s uid=%u\n", n, pkg, uid);
+		return false;
+	}
+
+	WRITE_ONCE(kp_manager_appids[n], uid);
+	/* Publish the count only after the slot is visible, so a concurrent
+	 * reader that sees n+1 entries can never read an empty slot. */
+	smp_wmb();
+	WRITE_ONCE(kp_manager_nappids, n + 1);
+	logki("trusted manager crowned: %s uid=%u (%d/%d)\n", pkg, uid, n + 1,
+	      KP_MANAGER_MAX);
+	return true;
 }
 
 struct kp_scan_ctx {
@@ -155,11 +220,16 @@ struct kp_scan_ctx {
 	char parent[KP_PATH_LEN];
 	int depth;
 	int use_tmp;
-	bool found;
+	int crowned;
 };
 
-static void kp_scan_apk_dir(const char *dir, int depth, bool *found, int use_tmp);
+static void kp_scan_apk_dir(const char *dir, int depth, int *crowned, int use_tmp);
 
+/* Walk the whole /data/app tree. The old actor returned FILLDIR_STOP as soon
+ * as one trusted apk matched, which is exactly what made multi-manager
+ * impossible: a second installed manager was never even examined. Now every
+ * base.apk is checked and every match is crowned; the walk only stops early
+ * once the table is full, because nothing further could be recorded. */
 static FILLDIR_RETURN kp_dir_actor(struct dir_context *ctx, const char *name, int namelen, loff_t off, u64 ino,
 				   unsigned int d_type)
 {
@@ -167,7 +237,7 @@ static FILLDIR_RETURN kp_dir_actor(struct dir_context *ctx, const char *name, in
 	char path[KP_PATH_LEN];
 	(void)off; (void)ino;
 
-	if (sc->found)
+	if (READ_ONCE(kp_manager_nappids) >= KP_MANAGER_MAX)
 		return FILLDIR_STOP;
 	if (!strncmp(name, "..", namelen) || !strncmp(name, ".", namelen))
 		return FILLDIR_CONTINUE;
@@ -175,23 +245,21 @@ static FILLDIR_RETURN kp_dir_actor(struct dir_context *ctx, const char *name, in
 		return FILLDIR_CONTINUE;
 
 	if (d_type == DT_DIR && sc->depth > 0) {
-		kp_scan_apk_dir(path, sc->depth - 1, &sc->found, sc->use_tmp);
+		kp_scan_apk_dir(path, sc->depth - 1, &sc->crowned, sc->use_tmp);
 	} else if (d_type == DT_REG && namelen == 8 && !strncmp(name, "base.apk", 8)) {
 		int idx = kp_manager_apk_match(path);
-		if (idx >= 0) {
-			kp_crown_manager(idx, sc->use_tmp);
-			sc->found = true;
-		}
+		if (idx >= 0 && kp_crown_manager(idx, sc->use_tmp))
+			sc->crowned++;
 	}
-	return sc->found ? FILLDIR_STOP : FILLDIR_CONTINUE;
+	return FILLDIR_CONTINUE;
 }
 
-static void kp_scan_apk_dir(const char *dir, int depth, bool *found, int use_tmp)
+static void kp_scan_apk_dir(const char *dir, int depth, int *crowned, int use_tmp)
 {
 	struct file *fp;
 	struct kp_scan_ctx sc;
 
-	if (*found)
+	if (READ_ONCE(kp_manager_nappids) >= KP_MANAGER_MAX)
 		return;
 	fp = filp_open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
 	if (IS_ERR(fp))
@@ -201,22 +269,29 @@ static void kp_scan_apk_dir(const char *dir, int depth, bool *found, int use_tmp
 	strscpy(sc.parent, dir, sizeof(sc.parent));
 	sc.depth = depth;
 	sc.use_tmp = use_tmp;
-	sc.found = *found;
+	sc.crowned = crowned ? *crowned : 0;
 	iterate_dir(fp, &sc.ctx);
-	*found = sc.found;
+	if (crowned)
+		*crowned = sc.crowned;
 	filp_close(fp, NULL);
 }
 
 static int kp_manager_scan(int use_tmp)
 {
-	bool found = false;
+	int crowned = 0;
+	int total;
 
 	/* /data/app/<pkg>-N/base.apk (pre-11) and /data/app/~~h/<pkg>-h/base.apk
 	 * (11+): depth 2 covers both. */
-	kp_scan_apk_dir(KP_DATA_APP, 2, &found, use_tmp);
-	if (!found)
+	kp_scan_apk_dir(KP_DATA_APP, 2, &crowned, use_tmp);
+
+	total = READ_ONCE(kp_manager_nappids);
+	if (crowned)
+		logki("manager scan: %d newly crowned, %d total\n", crowned, total);
+	else if (!total)
 		logki("trusted manager not found yet (scan incomplete or not installed)\n");
-	return found ? 0 : -ENOENT;
+
+	return total ? 0 : -ENOENT;
 }
 
 static void kp_manager_scan_work_fn(struct work_struct *work)
@@ -253,7 +328,7 @@ int kp_manager_init(void)
 
 #define KP_PACKAGES_LIST_TMP_SUFFIX "/system/packages.list.tmp"
 
-/* Must match dentry_path_raw() exactly (note the const) — kCFI type-hashes the
+/* Must match dentry_path_raw() exactly (note the const) - kCFI type-hashes the
  * indirect call, and a non-const first arg panics __cfi_slowpath_diag. */
 typedef char *(*kp_dentry_path_raw_t)(const struct dentry *dentry, char *buf, int buflen);
 static kp_dentry_path_raw_t kp_dentry_path_raw;
