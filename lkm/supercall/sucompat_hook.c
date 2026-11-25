@@ -23,6 +23,7 @@
 #include <scdefs.h>
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 #include "../infra/syscall_table.h"
 #include "../manager/manager.h"
 #include <hook.h>
@@ -151,11 +152,11 @@ static long kp_redirect_to_sh(const struct pt_regs *regs, const char *what, uid_
 		}
 	}
 
-	return kp_orig_execve(regs);
+	return (long)kp_call1((void *)kp_orig_execve, (unsigned long)regs);
 
 passthrough:
 	if (kp_orig_execve)
-		return kp_orig_execve(regs);
+		return (long)kp_call1((void *)kp_orig_execve, (unsigned long)regs);
 	return -ENOSYS;
 }
 
@@ -198,9 +199,9 @@ static void kp_after_getname_flags(hook_fargs4_t *args, void *udata)
 		kp_getname = (typeof(kp_getname))kallsyms_lookup_name("getname_kernel");
 		kp_putname = (typeof(kp_putname))kallsyms_lookup_name("putname");
 		if (kp_getname && kp_putname) {
-			struct filename *nf = kp_getname(sh_path);
+			struct filename *nf = (struct filename *)kp_call1((void *)kp_getname, (unsigned long)sh_path);
 			if (!IS_ERR_OR_NULL(nf)) {
-				kp_putname(fn);
+				kp_call1((void *)kp_putname, (unsigned long)fn);
 				args->ret = (unsigned long)nf;
 			}
 		}
@@ -294,7 +295,7 @@ static long kp_execve_handler(const struct pt_regs *regs)
 
 passthrough:
 	if (kp_orig_execve)
-		return kp_orig_execve(regs);
+		return (long)kp_call1((void *)kp_orig_execve, (unsigned long)regs);
 	return -ENOSYS;
 }
 
