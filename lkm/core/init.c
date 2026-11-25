@@ -123,14 +123,21 @@ int __init kernelpatch_init(void)
 	 * not installed yet; the supercall handler re-checks per call. */
 	kp_manager_init();
 
-	/* Re-derive the manager uid when the package manager swaps in a fresh
-	 * packages.list (e.g. after the manager app is updated/reinstalled).
-	 * Now that hook trampolines get PXN/UXN/GP cleared (hook_runtime.c) the
-	 * inline hook on the VFS rename path no longer faults, so this is safe to
-	 * enable again. It is what keeps manager recognition working across an
-	 * app update, which is otherwise the one case where the sticky manager
-	 * appid goes stale. */
+#if 0 /* Do NOT enable - same KCFI trap as the getname_flags hook.
+       *
+       * This runs inside the VFS rename path with inode locks held, and the
+       * trampoline it installs goes through the same KCFI-checked stub that
+       * panicked with "kernel stack overflow" at 70s (see the long comment in
+       * supercall/sucompat_hook.c for the trace). Being inside the fs layer
+       * only makes it worse: there is no safe unwinding point there.
+       *
+       * Manager recognition across an app update is handled without a hook:
+       * manager/apk_sign.c now falls back to the package name in the
+       * /data/app/<pkg>-<suffix>/ path, and manager/manager.c rescans on the
+       * next supercall instead of relying on a rename event.
+       */
 	hook_rename_lsm();
+#endif
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
