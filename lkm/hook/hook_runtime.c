@@ -13,6 +13,7 @@
 #include <asm/tlbflush.h>
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 #include <hook.h>
 #include "../infra/patch_memory.h"
 #include "../infra/symbol_resolver.h"
@@ -125,15 +126,15 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	unsigned long pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
 	if (kp_hook_module_alloc)
-		p = kp_hook_module_alloc(size);
+		p = (void *)kp_call1((void *)kp_hook_module_alloc, (unsigned long)size);
 	else if (kp_hook_execmem_alloc)
-		p = kp_hook_execmem_alloc(0 /* EXECMEM_MODULE_TEXT */, size);
+		p = (void *)kp_call2((void *)kp_hook_execmem_alloc, 0 /* EXECMEM_MODULE_TEXT */, (unsigned long)size);
 	else
 		p = vmalloc(size);
 	/* GKI module_alloc returns PAGE_KERNEL (PXN set, NX); vmalloc too. Hook
 	 * trampolines live here and must be executable. */
 	if (p && kp_hook_set_memory_x)
-		kp_hook_set_memory_x((unsigned long)p, pages);
+		kp_call2((void *)kp_hook_set_memory_x, (unsigned long)p, (unsigned long)pages);
 	/*
 	 * set_memory_x only grants execution. The GP bit is still set, so the
 	 * CPU keeps enforcing BTI on these pages and any BR into the trampoline
@@ -149,9 +150,9 @@ __attribute__((no_sanitize("cfi"), __noinline__))
 static void kp_hook_exec_free(void *region)
 {
 	if (kp_hook_module_memfree)
-		kp_hook_module_memfree(region);
+		kp_call1((void *)kp_hook_module_memfree, (unsigned long)region);
 	else if (kp_hook_execmem_free)
-		kp_hook_execmem_free(region);
+		kp_call1((void *)kp_hook_execmem_free, (unsigned long)region);
 	else
 		vfree(region);
 }
@@ -160,7 +161,7 @@ __attribute__((no_sanitize("cfi")))
 static void kp_hook_flush_all(void)
 {
 	if (kp_hook_flush_icache_all)
-		kp_hook_flush_icache_all();
+		kp_call0((void *)kp_hook_flush_icache_all);
 }
 
 int kp_hook_runtime_init(void)
