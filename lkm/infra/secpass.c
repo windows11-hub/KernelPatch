@@ -2,7 +2,7 @@
 /*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  *
- * Port of kernel/patch/common/secpass.c — CFI-bypass for the LKM.
+ * Port of kernel/patch/common/secpass.c - CFI-bypass for the LKM.
  * Hooks report_cfi_failure / __cfi_slowpath_diag so that a CFI mismatch
  * on LKM text / hook trampoline / KPM memory degrades to a WARN instead
  * of panicking the kernel.
@@ -16,6 +16,8 @@
 #include "../include/kp_lkm.h"
 #include "../kpm/module.h"
 #include <hook.h>
+
+#include "../include/kp_call.h"
 
 struct pt_regs;
 
@@ -89,7 +91,9 @@ static kp_cfi_check_fn __replace_find_check_fn(unsigned long addr)
 	if (kp_should_cfi_pass(addr))
 		return kp_noop_cfi_check;
 	if (__backup_find_check_fn)
-		return __backup_find_check_fn(addr);
+		/* Raw pointer calls go through inline asm so the compiler does not emit
+	 * a KCFI type-hash check that can never pass. See kp_call.h. */
+	return (kp_cfi_check_fn)kp_call1((void *)__backup_find_check_fn, (unsigned long)addr);
 	return kp_noop_cfi_check;
 }
 
@@ -104,7 +108,9 @@ static int __replace_report_cfi_failure(struct pt_regs *regs, unsigned long addr
 {
 	if (kp_should_cfi_pass(*target))
 		return BUG_TRAP_TYPE_WARN;
-	return __backup_report_cfi_failure(regs, addr, target, type);
+	return (int)kp_call4((void *)__backup_report_cfi_failure,
+			     (unsigned long)regs, (unsigned long)addr,
+			     (unsigned long)target, (unsigned long)type);
 }
 
 /* ---- __cfi_slowpath_diag / __cfi_slowpath (5.10+) -------------------- */
@@ -116,7 +122,8 @@ static void __replace_cfi_slowpath(uint64_t id, void *ptr, void *diag)
 {
 	if (kp_should_cfi_pass((unsigned long)ptr))
 		return;
-	__backup_cfi_slowpath(id, ptr, diag);
+	kp_call3((void *)__backup_cfi_slowpath, (unsigned long)id,
+		 (unsigned long)ptr, (unsigned long)diag);
 }
 
 /* ---- public ----------------------------------------------------------- */
