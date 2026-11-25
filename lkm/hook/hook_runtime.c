@@ -134,7 +134,7 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	/* GKI module_alloc returns PAGE_KERNEL (PXN set, NX); vmalloc too. Hook
 	 * trampolines live here and must be executable. */
 	if (p && kp_hook_set_memory_x)
-		kp_call2((void *)kp_hook_set_memory_x, (unsigned long)p, (unsigned long)pages);
+		(void)kp_call2((void *)kp_hook_set_memory_x, (unsigned long)p, (unsigned long)pages);
 	/*
 	 * set_memory_x only grants execution. The GP bit is still set, so the
 	 * CPU keeps enforcing BTI on these pages and any BR into the trampoline
@@ -150,9 +150,9 @@ __attribute__((no_sanitize("cfi"), __noinline__))
 static void kp_hook_exec_free(void *region)
 {
 	if (kp_hook_module_memfree)
-		kp_call1((void *)kp_hook_module_memfree, (unsigned long)region);
+		(void)kp_call1((void *)kp_hook_module_memfree, (unsigned long)region);
 	else if (kp_hook_execmem_free)
-		kp_call1((void *)kp_hook_execmem_free, (unsigned long)region);
+		(void)kp_call1((void *)kp_hook_execmem_free, (unsigned long)region);
 	else
 		vfree(region);
 }
@@ -161,7 +161,7 @@ __attribute__((no_sanitize("cfi")))
 static void kp_hook_flush_all(void)
 {
 	if (kp_hook_flush_icache_all)
-		kp_call0((void *)kp_hook_flush_icache_all);
+		(void)kp_call0((void *)kp_hook_flush_icache_all);
 }
 
 int kp_hook_runtime_init(void)
