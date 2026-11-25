@@ -137,9 +137,9 @@ __attribute__((no_sanitize("cfi"), __noinline__))
 static void kp_free_exec(void *region)
 {
 	if (kp_module_memfree)
-		kp_call1((void *)kp_module_memfree, (unsigned long)region);
+		(void)kp_call1((void *)kp_module_memfree, (unsigned long)region);
 	else if (kp_execmem_free)
-		kp_call1((void *)kp_execmem_free, (unsigned long)region);
+		(void)kp_call1((void *)kp_execmem_free, (unsigned long)region);
 	else
 		vfree(region);
 }
