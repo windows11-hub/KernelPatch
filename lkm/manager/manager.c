@@ -107,10 +107,6 @@ static uid_t kp_lookup_package_uid(const char *package, int use_tmp)
 	const char *path = use_tmp ? KP_PACKAGES_LIST_TMP : KP_PACKAGES_LIST;
 	struct file *fp;
 	loff_t fsize;
-
-	const char *path = use_tmp ? KP_PACKAGES_LIST_TMP : KP_PACKAGES_LIST;
-	struct file *fp;
-	loff_t fsize;
 	char *buf, *cursor, *end;
 	uid_t uid = KP_INVALID_APPID;
 
