@@ -2,10 +2,9 @@
 /*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  *
- * Credential switching. Ported from kernel/patch/common/accctl.c but uses the
- * real struct cred fields directly (the ko is KMI-bound, so offsets match),
- * avoiding KP's hardcoded cred_offset. SELinux translabel (set_security_
- * override_from_ctx) is TODO — it needs KP's sepolicy machinery.
+ * Credential switching and SELinux enforcement bypass. Ported from
+ * kernel/patch/common/accctl.c; the ko is KMI-bound so struct cred fields are
+ * addressed directly instead of through KP's runtime cred_offset.
  */
 #ifndef _KP_LKM_ACCCTL_H_
 #define _KP_LKM_ACCCTL_H_
@@ -13,6 +12,10 @@
 
 /* Resolve the SELinux translabel helper at init. */
 int kp_accctl_init(void);
+
+/* Hook avc_denied / slow_avc_audit so a denial for a root-granted uid is
+ * decided as an allow and not audited. Must run after kp_hook_runtime_init(). */
+int kp_selinux_bypass_init(void);
 
 /* Grant root to the current task (uid/gid -> to_uid, all caps). */
 int kp_commit_su(uid_t to_uid, const char *sctx);
