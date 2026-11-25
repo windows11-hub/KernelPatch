@@ -37,6 +37,10 @@
 #define KP_PACKAGES_LIST_TMP "/data/system/packages.list.tmp"
 #define KP_DATA_APP "/data/app"
 #define KP_PATH_LEN 256
+#define KP_NAME_LEN 128
+/* /data/app on a 400-app device is a few hundred entries; 512 covers it
+ * without a large allocation. Overflow stops the listing instead of growing. */
+#define KP_MAX_DIRENTS 512
 
 /* filldir calling convention changed in 6.1 (int -> bool). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -176,10 +180,32 @@ out_close:
 	return uid;
 }
 
-/* Crown one more manager. Returns true when a new appid was recorded, false
- * when it failed or was already known. Keeping this additive is what allows
- * more than one manager: the old code overwrote a single scalar and the scan
- * stopped at the first hit. */
+/* ---- deferred crowning ------------------------------------------------
+ *
+ * The filldir callback runs inside f2fs_readdir() with the directory lock, so it
+ * may not touch the filesystem. It already stopped hashing apks; it also used
+ * to call kp_crown_manager() -> kp_lookup_package_uid() -> filp_open() on
+ * /data/system/packages.list, which is the same violation one level down: a
+ * file open on the f2fs mount while that mount's readdir is running. On this
+ * device that nested until the kernel stack overflowed.
+ *
+ * So the walk now only records which trusted package name it saw, as a small
+ * bitmask in the scan context. Every file operation happens after iterate_dir
+ * has returned and filp_close() has dropped the directory reference. */
+static bool kp_crown_manager(int manager_idx, int use_tmp);
+
+static void kp_crown_pending(unsigned int *seen, int use_tmp)
+{
+	int i;
+
+	for (i = 0; kp_trusted_managers[i].package; i++) {
+		if (!(*seen & (1u << i)))
+			continue;
+		*seen &= ~(1u << i);
+		kp_crown_manager(i, use_tmp);
+	}
+}
+
 static bool kp_crown_manager(int manager_idx, int use_tmp)
 {
 	const char *pkg = kp_trusted_managers[manager_idx].package;
@@ -215,7 +241,7 @@ static bool kp_crown_manager(int manager_idx, int use_tmp)
  *
  * Why not the certificate: hashing an apk means opening it and reading it,
  * and the only place this runs is inside a readdir callback (see
- * kp_dir_actor). Doing I/O there deadlocks the f2fs directory lock on this
+ * the filldir callback). Doing I/O there deadlocks the f2fs directory lock on this
  * device and turns a load-time scan into a 70-second stall.
  *
  * What that costs: anyone who can install a package with a trusted id gets
@@ -249,82 +275,145 @@ static int kp_manager_apk_match_name(const char *dir)
 	return -1;
 }
 
-struct kp_scan_ctx {
+/* One directory listing. The actor only ever copies names out - it never
+ * opens, stats or recurses, because it runs inside f2fs_readdir() with the
+ * directory lock held. Recursion used to happen there too, which is what the
+ * panic trace showed as kp_scan_apk_dir -> filldir -> f2fs_fill_dentries
+ * repeated until the kernel stack overflowed. */
+struct kp_list_ctx {
 	struct dir_context ctx;
 	char parent[KP_PATH_LEN];
-	int depth;
-	int use_tmp;
-	int crowned;
+	char (*names)[KP_NAME_LEN];
+	int max;
+	int count;
 };
 
-static void kp_scan_apk_dir(const char *dir, int depth, int *crowned, int use_tmp);
-
-/* Walk the whole /data/app tree. The old actor returned FILLDIR_STOP as soon
- * as one trusted apk matched, which is exactly what made multi-manager
- * impossible: a second installed manager was never even examined. Now every
- * base.apk is checked and every match is crowned; the walk only stops early
- * once the table is full, because nothing further could be recorded. */
-static FILLDIR_RETURN kp_dir_actor(struct dir_context *ctx, const char *name, int namelen, loff_t off, u64 ino,
+static FILLDIR_RETURN kp_list_actor(struct dir_context *ctx, const char *name, int namelen, loff_t off, u64 ino,
 				   unsigned int d_type)
 {
-	struct kp_scan_ctx *sc = container_of(ctx, struct kp_scan_ctx, ctx);
-	char path[KP_PATH_LEN];
+	struct kp_list_ctx *lc = container_of(ctx, struct kp_list_ctx, ctx);
 	(void)off; (void)ino;
 
-	if (READ_ONCE(kp_manager_nappids) >= KP_MANAGER_MAX)
-		return FILLDIR_STOP;
 	if (!strncmp(name, "..", namelen) || !strncmp(name, ".", namelen))
 		return FILLDIR_CONTINUE;
-	if (snprintf(path, sizeof(path), "%s/%.*s", sc->parent, namelen, name) >= (int)sizeof(path))
+	if (namelen >= KP_NAME_LEN)
 		return FILLDIR_CONTINUE;
 
-	/* NOTE: no file I/O is allowed inside this callback.
-	 *
-	 * This runs under f2fs_readdir() with the directory lock held. Reading
-	 * base.apk here (to hash its v2 certificate) means kernel_read() on the
-	 * same f2fs mount from inside its own readdir, for every installed app.
-	 * Measured on this device: the scan was still running 70 seconds into
-	 * module_init, which is what left the module half-initialised while the
-	 * rest of the system kept calling into it. It also nests: reading an
-	 * apk can itself trigger path lookups that come back through the same
-	 * dentry walk.
-	 *
-	 * So the walk only ever compares names here - pure string work, no
-	 * locks taken beyond the one already held, no allocation beyond a stack
-	 * buffer. A base.apk whose parent directory is "<trusted-pkg>-<suffix>"
-	 * is a match; that is decided entirely from the path, and the digest is
-	 * not consulted. See the comment on kp_manager_apk_match_name() below
-	 * for what that trades away and why it is acceptable here. */
-	if (d_type == DT_DIR && sc->depth > 0) {
-		kp_scan_apk_dir(path, sc->depth - 1, &sc->crowned, sc->use_tmp);
-	} else if (d_type == DT_REG && namelen == 8 && !strncmp(name, "base.apk", 8)) {
-		int idx = kp_manager_apk_match_name(sc->parent);
-		if (idx >= 0 && kp_crown_manager(idx, sc->use_tmp))
-			sc->crowned++;
-	}
+	if (d_type != DT_DIR)
+		return FILLDIR_CONTINUE;
+
+	if (lc->count >= lc->max)
+		return FILLDIR_STOP;
+	memcpy(lc->names[lc->count], name, namelen);
+	lc->names[lc->count][namelen] = '\0';
+	lc->count++;
 	return FILLDIR_CONTINUE;
 }
 
-static void kp_scan_apk_dir(const char *dir, int depth, int *crowned, int use_tmp)
+/* List the DT_DIR entries of @dir into @names. Returns the count, or a negative
+ * errno. No file is opened while iterate_dir is running. */
+static int kp_list_subdirs(const char *dir, char (*names)[KP_NAME_LEN], int max)
 {
 	struct file *fp;
-	struct kp_scan_ctx sc;
+	struct kp_list_ctx lc;
+	int ret;
 
-	if (READ_ONCE(kp_manager_nappids) >= KP_MANAGER_MAX)
-		return;
 	fp = filp_open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
 	if (IS_ERR(fp))
-		return;
-	memset(&sc, 0, sizeof(sc));
-	sc.ctx.actor = kp_dir_actor;
-	strscpy(sc.parent, dir, sizeof(sc.parent));
-	sc.depth = depth;
-	sc.use_tmp = use_tmp;
-	sc.crowned = crowned ? *crowned : 0;
-	iterate_dir(fp, &sc.ctx);
-	if (crowned)
-		*crowned = sc.crowned;
+		return PTR_ERR(fp);
+	memset(&lc, 0, sizeof(lc));
+	lc.ctx.actor = kp_list_actor;
+	strscpy(lc.parent, dir, sizeof(lc.parent));
+	lc.names = names;
+	lc.max = max;
+	ret = iterate_dir(fp, &lc.ctx);
 	filp_close(fp, NULL);
+	if (ret < 0)
+		return ret;
+	return lc.count;
+}
+
+/* Does @dir hold a base.apk, and does @dir name a trusted package?
+ *
+ * The second half is decided from the path alone ("/<pkg>-" as a component),
+ * so no apk is ever opened. See kp_manager_apk_match_name(). */
+static int kp_check_pkg_dir(const char *dir)
+{
+	int idx = kp_manager_apk_match_name(dir);
+	char path[KP_PATH_LEN];
+	struct file *fp;
+
+	if (idx < 0)
+		return -1;
+
+	/* Name matched; confirm a base.apk is actually there. This open happens
+	 * after the directory listing has finished, so no f2fs dir lock is held. */
+	if (snprintf(path, sizeof(path), "%s/base.apk", dir) >= (int)sizeof(path))
+		return -1;
+	fp = filp_open(path, O_RDONLY | O_NOFOLLOW, 0);
+	if (IS_ERR(fp))
+		return -1;
+	filp_close(fp, NULL);
+	return idx;
+}
+
+/* Walk /data/app level by level, never recursing from inside a readdir.
+ *
+ * Shape being walked:
+ *   /data/app/base.apk                      (rare, legacy)
+ *   /data/app/<pkg>-<suffix>/base.apk
+ *   /data/app/~~<hash>/<pkg>-<suffix>/base.apk   (Android 11+)
+ * so it is at most three levels and can be done with explicit passes. */
+static void kp_scan_apk_dir(const char *root, int *crowned, int use_tmp)
+{
+	char (*lvl1)[KP_NAME_LEN];
+	char (*lvl2)[KP_NAME_LEN];
+	unsigned int seen = 0;
+	int n1, n2, i, j;
+
+	lvl1 = kvcalloc(1, sizeof(*lvl1) * KP_MAX_DIRENTS, GFP_KERNEL);
+	lvl2 = kvcalloc(1, sizeof(*lvl2) * KP_MAX_DIRENTS, GFP_KERNEL);
+	if (!lvl1 || !lvl2)
+		goto out;
+
+	n1 = kp_list_subdirs(root, lvl1, KP_MAX_DIRENTS);
+	if (n1 <= 0)
+		goto out;
+
+	for (i = 0; i < n1; i++) {
+		char path[KP_PATH_LEN];
+		int idx;
+
+		if (snprintf(path, sizeof(path), "%s/%s", root, lvl1[i]) >= (int)sizeof(path))
+			continue;
+
+		/* Level 1 may itself be a package directory on pre-11 layouts. */
+		idx = kp_check_pkg_dir(path);
+		if (idx >= 0)
+			seen |= 1u << idx;
+
+		if (READ_ONCE(kp_manager_nappids) >= KP_MANAGER_MAX)
+			break;
+
+		n2 = kp_list_subdirs(path, lvl2, KP_MAX_DIRENTS);
+		for (j = 0; j < n2; j++) {
+			char sub[KP_PATH_LEN];
+
+			if (snprintf(sub, sizeof(sub), "%s/%s", path, lvl2[j]) >= (int)sizeof(sub))
+				continue;
+			idx = kp_check_pkg_dir(sub);
+			if (idx >= 0)
+				seen |= 1u << idx;
+		}
+	}
+
+out:
+	if (seen)
+		kp_crown_pending(&seen, use_tmp);
+	if (crowned)
+		*crowned = READ_ONCE(kp_manager_nappids);
+	kvfree(lvl1);
+	kvfree(lvl2);
 }
 
 static int kp_manager_scan(int use_tmp)
@@ -332,9 +421,7 @@ static int kp_manager_scan(int use_tmp)
 	int crowned = 0;
 	int total;
 
-	/* /data/app/<pkg>-N/base.apk (pre-11) and /data/app/~~h/<pkg>-h/base.apk
-	 * (11+): depth 2 covers both. */
-	kp_scan_apk_dir(KP_DATA_APP, 2, &crowned, use_tmp);
+	kp_scan_apk_dir(KP_DATA_APP, &crowned, use_tmp);
 
 	total = READ_ONCE(kp_manager_nappids);
 	if (crowned)
@@ -364,14 +451,27 @@ int kp_manager_refresh_from_packages_list_tmp(void)
 
 int kp_manager_init(void)
 {
-	/* Run the scan synchronously in the module_init context instead of a
-	 * workqueue. The workqueue runs as a kernel thread in the u:r:kernel:s0
-	 * SELinux domain, which many devices (e.g. MTK) deny from reading
-	 * /data/app and /data/system/packages.list (dac_read_search/dac_override
-	 * denied). The insmod/kpinit caller, by contrast, is root (su domain) and
-	 * usually has permission to read /data. */
+	/* Scan asynchronously, never from module_init.
+	 *
+	 * Scanning synchronously here was measured to be the worst of both
+	 * worlds: module_init stayed inside iterate_dir() over /data/app for
+	 * tens of seconds, so kp_supercall_install() never ran and the manager
+	 * saw a half-loaded module the whole time. Any supercall in that window
+	 * found an empty manager table and answered -EPERM, which is exactly
+	 * the "-1" that looked like a broken supercall.
+	 *
+	 * Scheduling it means the module finishes loading immediately, the
+	 * supercall channel comes up, and the table fills in a moment later.
+	 * Supercalls that arrive before then return -EPERM once and succeed on
+	 * retry - visible, non-fatal, and fixed by tapping again.
+	 *
+	 * The kernel-thread SELinux note that used to justify doing this inline
+	 * still applies to some vendor ROMs (u:r:kernel:s0 denied dac_read_search
+	 * on /data). schedule_work() runs in a kworker for the same reason, so if
+	 * the scan comes up empty the caller can re-run kp_manager_refresh()
+	 * through the supercall path, which executes in the su-domain caller. */
 	INIT_WORK(&kp_manager_scan_work, kp_manager_scan_work_fn);
-	kp_manager_scan_work_fn(&kp_manager_scan_work);
+	schedule_work(&kp_manager_scan_work);
 	return 0;
 }
 
