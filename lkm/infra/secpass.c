@@ -122,7 +122,7 @@ static void __replace_cfi_slowpath(uint64_t id, void *ptr, void *diag)
 {
 	if (kp_should_cfi_pass((unsigned long)ptr))
 		return;
-	kp_call3((void *)__backup_cfi_slowpath, (unsigned long)id,
+	(void)kp_call3((void *)__backup_cfi_slowpath, (unsigned long)id,
 		 (unsigned long)ptr, (unsigned long)diag);
 }
 
