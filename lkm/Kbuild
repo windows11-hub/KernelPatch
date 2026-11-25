@@ -79,56 +79,32 @@ endif
 ccflags-y += -Wno-declaration-after-statement -Wno-unused-function -Wno-unused-variable
 ccflags-y += -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
 
-# The reused hook engine invokes raw KPM callbacks and relocated kernel text;
-# neither participates in the LKM CFI jump table.
-#
-# NOTE ON THE FLAG NAME. The kernel enables CFI with -fsanitize=kcfi (see
-# CC_FLAGS_CFI in the top-level Makefile), NOT with the older -fsanitize=cfi.
-# -fno-sanitize=cfi therefore disables a sanitizer that was never on, which is
-# why this exemption silently did nothing: every indirect call in these two
-# objects kept its KCFI type-hash check, and the transit stubs' calls into
-# relocated instruction bytes tripped it.
-#
-# -fno-sanitize=kcfi is the flag that actually turns it off, but the name only
-# exists in clang 14+ - the same version that introduced -fsanitize=kcfi. The
-# android12-5.10 matrix entry builds with clang-12, where passing it is a hard
-# error ("unsupported argument 'kcfi'"), so probe the compiler once at parse
-# time and only add the flag when it is genuinely understood.
-# Probe once: does this compiler know the kcfi sanitizer at all?
+# kcfi probe. Kept for the legacy -fno-sanitize spelling below; the module no
+# longer turns kcfi off anywhere, so this only reports what the toolchain knows.
 kp_kcfi_probe := $(shell echo 'int kp_cfi_probe(void){return 0;}' | \
 	$(CC) -fsanitize=kcfi -x c -c - -o /dev/null 2>/dev/null && echo yes)
 ifeq ($(kp_kcfi_probe),yes)
-KP_KCFI_FLAG := -fno-sanitize=kcfi
 KP_HAVE_KCFI := 1
 else
-KP_KCFI_FLAG :=
 KP_HAVE_KCFI := 0
 endif
-# Plain integer, never the attribute text itself: -D'__attribute__((no_sanitize("kcfi")))'
-# cannot survive shell quoting. The header expands the attribute only when this
-# is 1, i.e. only when the compiler is known to understand the name.
 ccflags-y += -DKP_HAVE_KCFI=$(KP_HAVE_KCFI)
-$(info -- KP kcfi: $(if $(filter 1,$(KP_HAVE_KCFI)),enabled,not supported by this compiler))
+$(info -- KP kcfi: $(if $(filter 1,$(KP_HAVE_KCFI)),supported by compiler,unknown))
 
-# Apply the exemption to EVERY object in this module, not to a hand-picked list.
+# kcfi stays ENABLED for this module.
 #
-# A per-object list is a trap: whichever file is left off still emits KCFI
-# type-hash loads, and the failure only shows up at runtime as
-#   CFI failure at <some hook>+0xNN (target: ..., expected type: ...)
-#   Internal error: Oops - CFI: 00000000f2008228
-# followed by a panic. That is exactly what happened with accctl.o - its
-# kp_avc_denied_hook calls the hook chain's relocated original, which carries no
-# type hash, and the check fired on the first file stat() after load.
+# Earlier revisions turned it off module-wide to stop "Oops - CFI" panics from
+# calls into relocated hook bytes and module_alloc memory. That worked, but it
+# meant the whole driver ran without the mitigation the kernel was built with,
+# and every new object that reached a raw pointer was one forgotten flag away
+# from panicking again (that is how accctl.o broke).
 #
-# Every object here can reach a raw function pointer: symbol_resolver returns
-# them, hook() hands back relocated originals, KPM images and kernel text are
-# called through addresses, and the manager scan calls into kernel fs helpers.
-# There is no object in this module for which the check buys anything, so the
-# exemption belongs at module scope.
-ccflags-y += $(KP_KCFI_FLAG)
+# The calls themselves are the problem, not the sanitizer: a C-level call
+# through an address with no KCFI type hash in front of it can never pass.
+# kp_call.h issues those branches in inline asm instead, so the compiler never
+# emits the check for them and everything else keeps its CFI.
 
-# kcfi is already off module-wide (ccflags-y above); the legacy
-# -fno-sanitize=cfi stays for toolchains that use that spelling instead.
+# Legacy spelling only. Real kcfi is handled by kp_call.h, not by flags.
 CFLAGS_hook/hook_engine.o += -fno-sanitize=cfi
 CFLAGS_hook/hook_engine.o += -fno-stack-protector -fno-jump-tables
 CFLAGS_hook/hook_engine.o += -fno-unwind-tables -fno-asynchronous-unwind-tables
