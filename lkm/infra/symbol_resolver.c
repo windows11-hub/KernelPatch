@@ -17,6 +17,7 @@
 #include <linux/version.h>
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 
 /* kallsyms_on_each_symbol() dropped the struct module * param from its
  * callback in 6.4; the callback and this fn-pointer type must match the
@@ -76,7 +77,7 @@ static int kp_variant_cb(void *data, const char *name, struct module *m, unsigne
 void *kp_resolve_symbol_variant(const char *name)
 {
 	/* Traditional CFI (< 6.1) requires calling functions through their .cfi_jt
-	 * canonical-jump-table entry, not the function body — a direct indirect
+	 * canonical-jump-table entry, not the function body - a direct indirect
 	 * call to the body trips __cfi_check (panic). Prefer the .cfi_jt variant,
 	 * then the exact symbol, then any .llvm.<hash> mangled name. */
 	char cfi_name[KSYM_NAME_LEN];
@@ -93,7 +94,7 @@ void *kp_resolve_symbol_variant(const char *name)
 	if (ctx.exact)
 		return (void *)ctx.exact;
 	if (kp_on_each_symbol) {
-		kp_on_each_symbol(kp_variant_cb, &ctx);
+		(int)kp_call2((void *)kp_on_each_symbol, (unsigned long)kp_variant_cb, (unsigned long)&ctx);
 		return (void *)ctx.variant;
 	}
 	return NULL;
