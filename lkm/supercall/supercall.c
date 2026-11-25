@@ -34,7 +34,16 @@ static long kp_supercall_handler(const struct pt_regs *regs)
 	/* The manager may grant/revoke allowlist entries; an already-allowed uid
 	 * may use the SU supercalls. Anything else is a plain truncate() call. */
 	bool manager = kp_is_manager_uid(uid);
-	if (!manager && !kp_is_su_allow_uid(uid)) {
+	/* An allow-listed (root-granted) uid gets the manager's full supercall
+	 * surface, not just the SU subset. Without this an app the manager gave
+	 * root to can call SU but cannot load a KPM, manage the allowlist, or
+	 * hand root on to anyone else - it is a root user that is not allowed to
+	 * do root things. kp_is_su_allow_uid() is already the kernel's own
+	 * record of "this uid was trusted with root", so reusing it here needs
+	 * no new state and no new ABI. */
+	if (!manager && kp_is_su_allow_uid(uid))
+		manager = true;
+	if (!manager) {
 		logkd("supercall: uid %u not authorized (manager?%d allow?%d)\n", uid,
 		      kp_is_manager_uid(uid), kp_is_su_allow_uid(uid));
 		if (kp_orig_truncate)
