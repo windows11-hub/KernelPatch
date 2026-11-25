@@ -849,7 +849,6 @@ long kp_load_module(const void *data, int len, const char *args, const char *eve
 	if (READ_ONCE(kp_kpm_dry_run)) {
 		logkw("KPM [%s] dry run: init NOT executed (image=%px size=%u)\n",
 		      mod->info.name, mod->start, mod->size);
-		mod->info.flags = 0;
 		list_add_tail(&mod->list, &modules.list);
 		pr_emerg(KPLKM_TAG ": KPM [%s] dry run complete, init skipped\n",
 			 mod->info.name);
