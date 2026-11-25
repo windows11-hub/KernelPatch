@@ -150,29 +150,51 @@ static inline unsigned long kp_call8(void *fn, unsigned long a0, unsigned long a
 
 /* Calls @fn with 12 arguments.
  *
- * No inline asm here, unlike the narrower variants. AAPCS64 passes arguments
- * 9..16 on the stack, and reaching those from inline asm means adjusting sp -
- * which the compiler does not track and which is undefined behaviour. Only
- * transit12 needs this signature, and no hook in this tree takes more than 8
- * arguments (avc_denied is the widest real one), so the pragmatic answer is a
- * plain call with the per-function CFI exemption where the compiler supports
- * it. On clang 14+ no_sanitize("kcfi") suppresses the check; on older
- * toolchains there is no kcfi instrumentation to suppress in the first place.
+ * AAPCS64 passes arguments 9..16 on the stack, so this one has to build the
+ * outgoing argument area itself: copy the tail into a local array, push it,
+ * blr, pop. The push/pop are balanced inside the asm, so the compiler's view of
+ * sp is still correct when the block ends, and "memory" tells it not to keep
+ * anything in the red zone across the call.
+ *
+ * Nothing in this tree actually reaches twelve arguments - the widest real hook
+ * is avc_denied at eight - but transit12 exists to preserve the signature, and
+ * leaving a C call here would be the one remaining place where the compiler
+ * could emit a KCFI check against an address that has no hash.
  */
-#if defined(KP_HAVE_KCFI) && KP_HAVE_KCFI
-__attribute__((no_sanitize("kcfi")))
-#endif
 static inline unsigned long kp_call12(void *fn, unsigned long a0, unsigned long a1,
 				      unsigned long a2, unsigned long a3, unsigned long a4,
 				      unsigned long a5, unsigned long a6, unsigned long a7,
 				      unsigned long a8, unsigned long a9, unsigned long a10,
 				      unsigned long a11)
 {
-	return ((unsigned long (*)(unsigned long, unsigned long, unsigned long,
-				   unsigned long, unsigned long, unsigned long,
-				   unsigned long, unsigned long, unsigned long,
-				   unsigned long, unsigned long, unsigned long))fn)(
-		a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+	unsigned long tail[4];
+	register unsigned long x0 __asm__("x0") = a0;
+	register unsigned long x1 __asm__("x1") = a1;
+	register unsigned long x2 __asm__("x2") = a2;
+	register unsigned long x3 __asm__("x3") = a3;
+	register unsigned long x4 __asm__("x4") = a4;
+	register unsigned long x5 __asm__("x5") = a5;
+	register unsigned long x6 __asm__("x6") = a6;
+	register unsigned long x7 __asm__("x7") = a7;
+
+	tail[0] = a8;
+	tail[1] = a9;
+	tail[2] = a10;
+	tail[3] = a11;
+
+	__asm__ volatile(
+		"sub  sp, sp, #32\n\t"
+		"ldp  x9, x10, [%[tail], #0]\n\t"
+		"stp  x9, x10, [sp, #0]\n\t"
+		"ldp  x9, x10, [%[tail], #16]\n\t"
+		"stp  x9, x10, [sp, #16]\n\t"
+		"blr  %[fn]\n\t"
+		"add  sp, sp, #32"
+		: "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3),
+		  "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+		: [fn] "r"(fn), [tail] "r"(tail)
+		: "x9", "x10", "lr", "cc", "memory");
+	return x0;
 }
 
 #else /* !__aarch64__ */
