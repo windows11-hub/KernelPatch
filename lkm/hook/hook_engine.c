@@ -31,7 +31,10 @@
  * these four functions. It has to be set here rather than in hook.c so the GKI
  * build of that file stays byte-identical to upstream.
  */
-#define KP_TRANSIT_ATTR __attribute__((no_sanitize("cfi")))
+/* no_sanitize names must match what the kernel actually enables: -fsanitize=kcfi.
+ * The string "cfi" refers to the legacy sanitizer and is accepted by the
+ * compiler but matches nothing when kcfi is on, so both spellings are listed. */
+#define KP_TRANSIT_ATTR __attribute__((no_sanitize("cfi", "kcfi")))
 
 /* The original kpimg linker script provides _transit*_end and copies each
  * transit function into hook memory. Linux modules have no such linker
