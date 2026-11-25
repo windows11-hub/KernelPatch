@@ -8,52 +8,20 @@
 #endif
 
 /*
- * KCFI exemption for the transit stubs in kernel/base/hook.c.
+ * The transit stubs no longer need a CFI exemption.
  *
- * Original KP links those four functions into hand-written .transitN.text
- * sections and copies the bytes into hook memory, so no compiler ever
- * instrumented them. The LKM build has no such linker markers: the trampoline
- * jumps to the resident C functions instead (see hook_chain_prepare below),
- * which means they ARE instrumented - and they make indirect calls to
- * relocated instruction bytes and to arbitrary hook callbacks, none of which
- * carry a CFI type hash.
+ * They used to call hook_chain->hook.relo_addr and the chain callbacks as C
+ * function pointers, which made the compiler emit a KCFI type-hash check that
+ * cannot pass for relocated instruction bytes (no hash in front of them) - so
+ * every such call panicked with "Oops - CFI". The exemption was attempted
+ * three ways (no_sanitize("cfi"), no_sanitize("kcfi"), -fno-sanitize=kcfi) and
+ * each had a failure mode: wrong sanitizer name, unsupported name on clang 12,
+ * or a module-wide blanket that left any forgotten object exposed.
  *
- * The consequence was measured, not theorised. getname_flags hooked, first
- * openat() after load:
- *   cfi_handler -> brk_handler -> do_debug_exception   (ESR 0xf2008228, KCFI)
- *   __replace_report_cfi_failure [kernelpatch]          (secpass.c hook)
- *   _transit4 -> getname -> do_sys_openat2
- * report_cfi_failure is itself hooked for the CFI-bypass feature, so the
- * failure re-entered the same stub until the kernel stack overflowed and the
- * board hard-rebooted 70 seconds after insmod.
- *
- * no_sanitize("cfi") suppresses the type-hash load at each indirect call in
- * these four functions. It has to be set here rather than in hook.c so the GKI
- * build of that file stays byte-identical to upstream.
+ * kernel/base/hook.c now routes those calls through kp_call.h, which issues
+ * them with inline asm (blr) so no check is generated at all. CFI stays on for
+ * the whole module and this file needs no special flags.
  */
-/* KCFI exemption for the transit stubs.
- *
- * This MUST come from the build system, not from a literal attribute here.
- * no_sanitize("kcfi") is only understood by clang 14+, and on older compilers
- * -Wunknown-sanitizers promotes it to a hard error (the build runs -Werror).
- * no_sanitize("cfi") is universally accepted but names the legacy sanitizer,
- * which the kernel never enables - it matches nothing.
- *
- * So Kbuild probes the compiler once and defines KP_KCFI_ATTR to either
- * __attribute__((no_sanitize("kcfi"))) or nothing. See lkm/Kbuild.
- * The object-level -fno-sanitize=kcfi flag there is the primary fix; this
- * attribute is belt-and-braces for the case where the object flag is dropped. */
-#ifndef KP_HAVE_KCFI
-#define KP_HAVE_KCFI 0
-#endif
-
-#if KP_HAVE_KCFI
-#define KP_KCFI_ATTR __attribute__((no_sanitize("kcfi")))
-#else
-#define KP_KCFI_ATTR
-#endif
-
-#define KP_TRANSIT_ATTR KP_KCFI_ATTR
 
 /* The original kpimg linker script provides _transit*_end and copies each
  * transit function into hook memory. Linux modules have no such linker
