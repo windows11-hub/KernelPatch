@@ -94,7 +94,14 @@ void *kp_resolve_symbol_variant(const char *name)
 	if (ctx.exact)
 		return (void *)ctx.exact;
 	if (kp_on_each_symbol) {
-		(int)kp_call2((void *)kp_on_each_symbol, (unsigned long)kp_variant_cb, (unsigned long)&ctx);
+		/* The return value only reports how many symbols were visited; what
+		 * matters is ctx.variant, filled by kp_variant_cb. Assign it to a
+		 * variable so the call is not a bare expression statement (which the
+		 * kernel build rejects under -Wunused-value). */
+		int visited = (int)kp_call2((void *)kp_on_each_symbol,
+					    (unsigned long)kp_variant_cb,
+					    (unsigned long)&ctx);
+		(void)visited;
 		return (void *)ctx.variant;
 	}
 	return NULL;
