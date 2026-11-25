@@ -2,12 +2,15 @@
 /* LKM backends required by kernel/base/hook.c. */
 #include <linux/errno.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
+#include <asm/pgtable.h>
+#include <asm/tlbflush.h>
 
 #include "../include/kp_lkm.h"
 #include <hook.h>
@@ -46,6 +49,71 @@ static void (*kp_hook_module_memfree)(void *region);
 static void (*kp_hook_flush_icache_all)(void);
 static int (*kp_hook_set_memory_x)(unsigned long addr, int numpages);
 
+/*
+ * Clear PXN / UXN / GP on a range of kernel pages (arm64).
+ *
+ * This is the part that was missing and the reason every inline hook faulted
+ * on GKI 6.6. module_alloc()/vmalloc() hand back PAGE_KERNEL: executable
+ * permission still has to be granted (set_memory_x does that), but the GP bit
+ * is what gates BTI. With GP set, the CPU requires a valid landing pad
+ * (bti c / bti j / bti jc) at every indirect branch target. A copied trampoline
+ * page cannot satisfy that for arbitrary entries, and a BR into module text
+ * compiled with "bti c" faults outright. Clearing GP tells the CPU not to
+ * check BTI for these pages, which is exactly the guarantee a hook trampoline
+ * needs: its entries are entered by BR, not by BL.
+ *
+ * Same bits and same technique as kp_clear_bti_gp() in kpm/module.c: walk the
+ * page tables of init_mm, rewrite the PTE, flush the TLB for that page. */
+#define KP_HR_PTE_PXN (1UL << 53)
+#define KP_HR_PTE_UXN (1UL << 54)
+#define KP_HR_PTE_GP  (1UL << 50)
+
+static struct mm_struct *kp_hook_init_mm;
+
+static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
+{
+	unsigned long addr, end;
+
+	if (!kp_hook_init_mm)
+		return;
+
+	end = base + size;
+	for (addr = base; addr < end; addr += PAGE_SIZE) {
+		pgd_t *pgd = pgd_offset(kp_hook_init_mm, addr);
+		p4d_t *p4d;
+		pud_t *pud;
+		pmd_t *pmd;
+		pte_t *pte;
+		pteval_t v;
+
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			continue;
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			continue;
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud) || pud_bad(*pud))
+			continue;
+		if (pud_sect(*pud))
+			continue;
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd) || pmd_bad(*pmd))
+			continue;
+		if (pmd_sect(*pmd))
+			continue;
+		pte = pte_offset_kernel(pmd, addr);
+		if (!pte || !pte_present(*pte))
+			continue;
+
+		v = pte_val(*pte);
+		if (v & (KP_HR_PTE_PXN | KP_HR_PTE_UXN | KP_HR_PTE_GP)) {
+			v &= ~(KP_HR_PTE_PXN | KP_HR_PTE_UXN | KP_HR_PTE_GP);
+			set_pte(pte, __pte(v));
+			flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
+		}
+	}
+}
+
 /* noinline: these are raw resolved function pointers; if inlined into a
  * CFI-instrumented caller, the compiler emits a kCFI type-hash load of
  * [fnptr - 4] that dereferences NULL when the allocator is absent (6.10+ has
@@ -66,6 +134,14 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	 * trampolines live here and must be executable. */
 	if (p && kp_hook_set_memory_x)
 		kp_hook_set_memory_x((unsigned long)p, pages);
+	/*
+	 * set_memory_x only grants execution. The GP bit is still set, so the
+	 * CPU keeps enforcing BTI on these pages and any BR into the trampoline
+	 * faults. Clear PXN/UXN/GP so the trampoline is enterable by BR, which
+	 * is how hook_chain_prepare() transfers control (LDR X16 + BR X16).
+	 */
+	if (p)
+		kp_hook_clear_exec_bits((unsigned long)p, pages << PAGE_SHIFT);
 	return p;
 }
 
@@ -95,6 +171,9 @@ int kp_hook_runtime_init(void)
 	kp_hook_execmem_free = (void *)kp_resolve_symbol("execmem_free");
 	kp_hook_flush_icache_all = (void *)kp_resolve_symbol("flush_icache_all");
 	kp_hook_set_memory_x = (int (*)(unsigned long, int))kp_resolve_symbol("set_memory_x");
+	kp_hook_init_mm = (struct mm_struct *)kp_resolve_symbol("init_mm");
+	if (!kp_hook_init_mm)
+		logkw("init_mm not found; hook pages keep the GP bit set and BTI will fault\n");
 	if (!kp_hook_module_alloc)
 		logkw("module_alloc not found; using execmem_alloc/vmalloc for hook memory\n");
 	if (!kp_hook_set_memory_x && !kp_hook_execmem_alloc) {
