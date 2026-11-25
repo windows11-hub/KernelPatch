@@ -305,16 +305,21 @@ int kp_sucompat_hook_init(void)
 		return rc;
 	logki("sucompat: execve hook installed (su path %s -> %s)\n", kp_su_get_path(), KP_SH_PATH);
 
-#if 0 /* FolkPatch stability patch: the getname_flags inline hook fires on every
-       * file open/stat/exec (hottest kernel path) and the trampoline hard-hangs
-       * GKI 6.6 jailbreak insmod. The execve hook above still handles su.
-       * Re-enable once the inline-hook engine is fixed. */
+	/* Path-probe redirect. The execve hook above only sees programs that are
+	 * actually exec'd; a loader that opens the su path with openat() and then
+	 * feeds the fd to fexecve(), or a stat() probe asking "does su exist",
+	 * never reaches it. getname_flags() is the single point every path-based
+	 * lookup goes through, so rewriting the name here covers both.
+	 *
+	 * This used to be disabled because the trampoline faulted on GKI 6.6 -
+	 * the hook pages were executable but still had the GP bit set, so BTI
+	 * rejected the BR into them. hook_runtime.c now clears PXN/UXN/GP, which
+	 * is what makes this safe to turn back on. */
 	rc = kp_hook_getname_flags();
 	if (rc)
-		logkfd("sucompat: getname_flags hook failed: %d\n", rc);
+		logkw("sucompat: getname_flags hook failed: %d\n", rc);
 	else
 		logki("sucompat: getname_flags hook installed\n");
-#endif
 	return 0;
 }
 
