@@ -31,6 +31,7 @@
 #include <linux/uaccess.h>
 
 #include "../include/kp_lkm.h"
+#include "../include/kp_call.h"
 #include <hook.h>
 
 #define KP_PACKAGES_LIST "/data/system/packages.list"
@@ -513,7 +514,8 @@ static void kp_refresh_manager_on_list_rename(struct dentry *dentry)
 
 	if (!dentry || !kp_dentry_path_raw)
 		return;
-	buf = kp_dentry_path_raw(dentry, path, sizeof(path));
+	buf = (char *)kp_call3((void *)kp_dentry_path_raw, (unsigned long)dentry,
+				 (unsigned long)path, (unsigned long)sizeof(path));
 	if (IS_ERR(buf))
 		return;
 	if (kp_path_has_suffix(buf, KP_PACKAGES_LIST_TMP_SUFFIX)) {
