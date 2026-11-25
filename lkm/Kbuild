@@ -87,10 +87,18 @@ ccflags-y += -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes
 # -fno-sanitize=cfi therefore disables a sanitizer that was never on, which is
 # why this exemption silently did nothing: every indirect call in these two
 # objects kept its KCFI type-hash check, and the transit stubs' calls into
-# relocated instruction bytes tripped it. -fno-sanitize=kcfi is the flag that
-# actually turns the check off; the old spelling is kept alongside it so a
-# toolchain that does use the legacy sanitizer is covered too.
-CFLAGS_hook/hook_engine.o += -fno-sanitize=cfi -fno-sanitize=kcfi
+# relocated instruction bytes tripped it.
+#
+# -fno-sanitize=kcfi is the flag that actually turns it off, but the name only
+# exists in clang 14+ - the same version that introduced -fsanitize=kcfi. The
+# android12-5.10 matrix entry builds with clang-12, where passing it is a hard
+# error ("unsupported argument 'kcfi'"), so probe the compiler once at parse
+# time and only add the flag when it is genuinely understood.
+KP_KCFI_FLAG := $(shell echo 'int kp_cfi_probe(void){return 0;}' | \
+	$(CC) -fsanitize=kcfi -x c -c - -o /dev/null 2>/dev/null && echo -fno-sanitize=kcfi)
+$(info -- KP kcfi flag: $(if $(KP_KCFI_FLAG),$(KP_KCFI_FLAG),none (compiler too old)))
+
+CFLAGS_hook/hook_engine.o += -fno-sanitize=cfi $(KP_KCFI_FLAG)
 CFLAGS_hook/hook_engine.o += -fno-stack-protector -fno-jump-tables
 CFLAGS_hook/hook_engine.o += -fno-unwind-tables -fno-asynchronous-unwind-tables
 CFLAGS_hook/hook_engine.o += -std=gnu11 -Wno-strict-prototypes
@@ -101,7 +109,7 @@ CFLAGS_hook/hook_engine.o += -fno-lto
 # secpass calls kernel function pointers through backup variables; exempt from
 # CFI so the backup calls don't recurse into the CFI slowpath. Same flag-name
 # correction as above: kcfi is what the kernel actually instruments with.
-CFLAGS_infra/secpass.o += -fno-sanitize=cfi -fno-sanitize=kcfi
+CFLAGS_infra/secpass.o += -fno-sanitize=cfi $(KP_KCFI_FLAG)
 # _transit4 runs from a kernel text function's inline hook; x18 there is NOT the
 # module's shadow-call-stack. Disable SCS so the transit never writes x30 through
 # x18 (str x30,[x18]) into garbage -> CPU fault -> watchdog bite on that core.
