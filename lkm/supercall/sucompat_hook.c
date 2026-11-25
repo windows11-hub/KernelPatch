@@ -201,7 +201,7 @@ static void kp_after_getname_flags(hook_fargs4_t *args, void *udata)
 		if (kp_getname && kp_putname) {
 			struct filename *nf = (struct filename *)kp_call1((void *)kp_getname, (unsigned long)sh_path);
 			if (!IS_ERR_OR_NULL(nf)) {
-				kp_call1((void *)kp_putname, (unsigned long)fn);
+				(void)kp_call1((void *)kp_putname, (unsigned long)fn);
 				args->ret = (unsigned long)nf;
 			}
 		}
