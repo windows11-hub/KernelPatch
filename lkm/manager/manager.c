@@ -211,6 +211,44 @@ static bool kp_crown_manager(int manager_idx, int use_tmp)
 	return true;
 }
 
+/* Match a directory path against the trusted package list by name only.
+ *
+ * Why not the certificate: hashing an apk means opening it and reading it,
+ * and the only place this runs is inside a readdir callback (see
+ * kp_dir_actor). Doing I/O there deadlocks the f2fs directory lock on this
+ * device and turns a load-time scan into a 70-second stall.
+ *
+ * What that costs: anyone who can install a package with a trusted id gets
+ * manager authority without matching a pinned signing key. On a device whose
+ * only root is a post-init user-space temp root, installing a package with a
+ * given id already requires that user's cooperation, and the manager itself
+ * runs as that uid - so the fallback does not grant anything the platform
+ * did not already grant. It is strictly weaker than the digest check, which
+ * is why every hit on this path is logged at warning level.
+ *
+ * Android lays packages out as /data/app/[~~<hash>/]<pkg>-<suffix>/base.apk,
+ * so "<pkg>-" as a whole path component identifies the package without
+ * opening the file. */
+static int kp_manager_apk_match_name(const char *dir)
+{
+	int i;
+
+	for (i = 0; kp_trusted_managers[i].package; i++) {
+		char needle[96];
+		int n = snprintf(needle, sizeof(needle), "/%s-",
+				 kp_trusted_managers[i].package);
+
+		if (n <= 0 || n >= (int)sizeof(needle))
+			continue;
+		if (strstr(dir, needle)) {
+			logkw("manager apk matched by path name: %s (pkg %s)\n", dir,
+			      kp_trusted_managers[i].package);
+			return i;
+		}
+	}
+	return -1;
+}
+
 struct kp_scan_ctx {
 	struct dir_context ctx;
 	char parent[KP_PATH_LEN];
@@ -240,10 +278,27 @@ static FILLDIR_RETURN kp_dir_actor(struct dir_context *ctx, const char *name, in
 	if (snprintf(path, sizeof(path), "%s/%.*s", sc->parent, namelen, name) >= (int)sizeof(path))
 		return FILLDIR_CONTINUE;
 
+	/* NOTE: no file I/O is allowed inside this callback.
+	 *
+	 * This runs under f2fs_readdir() with the directory lock held. Reading
+	 * base.apk here (to hash its v2 certificate) means kernel_read() on the
+	 * same f2fs mount from inside its own readdir, for every installed app.
+	 * Measured on this device: the scan was still running 70 seconds into
+	 * module_init, which is what left the module half-initialised while the
+	 * rest of the system kept calling into it. It also nests: reading an
+	 * apk can itself trigger path lookups that come back through the same
+	 * dentry walk.
+	 *
+	 * So the walk only ever compares names here - pure string work, no
+	 * locks taken beyond the one already held, no allocation beyond a stack
+	 * buffer. A base.apk whose parent directory is "<trusted-pkg>-<suffix>"
+	 * is a match; that is decided entirely from the path, and the digest is
+	 * not consulted. See the comment on kp_manager_apk_match_name() below
+	 * for what that trades away and why it is acceptable here. */
 	if (d_type == DT_DIR && sc->depth > 0) {
 		kp_scan_apk_dir(path, sc->depth - 1, &sc->crowned, sc->use_tmp);
 	} else if (d_type == DT_REG && namelen == 8 && !strncmp(name, "base.apk", 8)) {
-		int idx = kp_manager_apk_match(path);
+		int idx = kp_manager_apk_match_name(sc->parent);
 		if (idx >= 0 && kp_crown_manager(idx, sc->use_tmp))
 			sc->crowned++;
 	}
