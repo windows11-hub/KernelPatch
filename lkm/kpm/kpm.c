@@ -23,19 +23,21 @@
 
 long kp_kpm_load_sc(const char __user *upath, const char __user *uargs, void __user *reserved)
 {
-	char path[KPM_LOAD_PATH_LEN];
-	char *args;
-	long pathlen = strncpy_from_user(path, upath, sizeof(path));
-	if (pathlen <= 0)
-		return -EINVAL;
-
-	args = kzalloc(KPM_ARGS_LEN, GFP_KERNEL);
-	if (!args)
-		return -ENOMEM;
-	long arglen = strncpy_from_user(args, uargs, KPM_ARGS_LEN);
-	long rc = kp_load_module_path(path, arglen <= 0 ? NULL : args, reserved);
-	kfree(args);
-	return rc;
+	/* Stability guard. The LKM KPM loader hard-reboots GKI 6.6 the moment a
+	 * KPM's init runs: the inline-hook engine's trampolines fault on this
+	 * vendor kernel and there is no ramoops to capture the trace. Returning
+	 * a clean error keeps the manager's KPM page usable and the device
+	 * alive. KPM still works through a boot-patched kpimg, which is not
+	 * available on a locked-bootloader device; on such devices this feature
+	 * is simply unavailable rather than fatal.
+	 *
+	 * Remove this guard only together with a fix for the 6.6 trampoline
+	 * fault, and only with a way to capture the panic (ramoops or a serial
+	 * console), otherwise every attempt costs a hard reboot. */
+	(void)upath;
+	(void)uargs;
+	(void)reserved;
+	return -ENOSYS;
 }
 
 long kp_kpm_control_sc(const char __user *uname, const char __user *uctl_args,
