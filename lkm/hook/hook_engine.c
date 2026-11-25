@@ -7,6 +7,32 @@
 #define __noinline noinline
 #endif
 
+/*
+ * KCFI exemption for the transit stubs in kernel/base/hook.c.
+ *
+ * Original KP links those four functions into hand-written .transitN.text
+ * sections and copies the bytes into hook memory, so no compiler ever
+ * instrumented them. The LKM build has no such linker markers: the trampoline
+ * jumps to the resident C functions instead (see hook_chain_prepare below),
+ * which means they ARE instrumented - and they make indirect calls to
+ * relocated instruction bytes and to arbitrary hook callbacks, none of which
+ * carry a CFI type hash.
+ *
+ * The consequence was measured, not theorised. getname_flags hooked, first
+ * openat() after load:
+ *   cfi_handler -> brk_handler -> do_debug_exception   (ESR 0xf2008228, KCFI)
+ *   __replace_report_cfi_failure [kernelpatch]          (secpass.c hook)
+ *   _transit4 -> getname -> do_sys_openat2
+ * report_cfi_failure is itself hooked for the CFI-bypass feature, so the
+ * failure re-entered the same stub until the kernel stack overflowed and the
+ * board hard-rebooted 70 seconds after insmod.
+ *
+ * no_sanitize("cfi") suppresses the type-hash load at each indirect call in
+ * these four functions. It has to be set here rather than in hook.c so the GKI
+ * build of that file stays byte-identical to upstream.
+ */
+#define KP_TRANSIT_ATTR __attribute__((no_sanitize("cfi")))
+
 /* The original kpimg linker script provides _transit*_end and copies each
  * transit function into hook memory. Linux modules have no such linker
  * markers, so emit a small absolute branch to the resident LKM function. */
