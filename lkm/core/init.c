@@ -103,6 +103,13 @@ int __init kernelpatch_init(void)
 	if (rc)
 		logkw("kpm loader init failed: %d (KPM supercalls will return -ENOSYS)\n", rc);
 
+	/* Denials for root-granted uids must be decided as allows, otherwise the
+	 * process has uid 0 and full caps but still cannot open /data/adb. Runs
+	 * after kp_hook_runtime_init() because it needs the trampoline allocator. */
+	rc = kp_selinux_bypass_init();
+	if (rc)
+		logkw("selinux bypass init failed: %d\n", rc);
+
 	rc = kp_supercall_install();
 	if (rc)
 		return rc;
@@ -116,14 +123,14 @@ int __init kernelpatch_init(void)
 	 * not installed yet; the supercall handler re-checks per call. */
 	kp_manager_init();
 
-#if 0 /* FolkPatch stability patch: the rename LSM inline hook fires on every
-       * file/dir rename and runs dentry_path_raw()/kp_manager_scan() from the
-       * VFS rename path while its locks are held -> hard hang/reboot on GKI 6.6
-       * jailbreak insmod. Re-enable once the inline-hook engine is fixed. */
 	/* Re-derive the manager uid when the package manager swaps in a fresh
-	 * packages.list (e.g. after the manager app is updated/reinstalled). */
+	 * packages.list (e.g. after the manager app is updated/reinstalled).
+	 * Now that hook trampolines get PXN/UXN/GP cleared (hook_runtime.c) the
+	 * inline hook on the VFS rename path no longer faults, so this is safe to
+	 * enable again. It is what keeps manager recognition working across an
+	 * app update, which is otherwise the one case where the sticky manager
+	 * appid goes stale. */
 	hook_rename_lsm();
-#endif
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
