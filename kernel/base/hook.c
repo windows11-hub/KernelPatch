@@ -333,6 +333,28 @@ int32_t branch_from_to(uint32_t *tramp_buf, uint64_t src_addr, uint64_t dst_addr
     return ret_absolute(tramp_buf, dst_addr);
 }
 
+/* KCFI exemption for the transit stubs.
+ *
+ * These four functions make indirect calls to addresses the compiler cannot
+ * type-check: hook_chain->hook.relo_addr (relocated instruction bytes with no
+ * CFI hash prefix) and the befores/afters callbacks (arbitrary hook targets).
+ * With CFI enabled the compiler emits a type-hash load of [fnptr - 4] before
+ * each one; on relocated bytes that word is an instruction, the hash does not
+ * match, and the CPU takes a KCFI BRK (#0x8228).
+ *
+ * Measured on GKI 6.6: doing that from the getname_flags hook recursed through
+ * cfi_handler -> report_cfi_failure -> our own hook of report_cfi_failure and
+ * overflowed the kernel stack 70s after insmod.
+ *
+ * KP's own build escapes this because its transit stubs live in hand-written
+ * .transitN.text sections and are copied verbatim - no compiler, no checks.
+ * The LKM build jumps to these C versions instead (see hook_engine.c), so the
+ * exemption has to be explicit. The macro defaults to nothing so the GKI
+ * build of this same file is byte-identical. */
+#ifndef KP_TRANSIT_ATTR
+#define KP_TRANSIT_ATTR
+#endif
+
 // transit0
 typedef uint64_t (*transit0_func_t)();
 
@@ -342,7 +364,7 @@ typedef uint64_t (*transit0_func_t)();
     (hook_chain_t *)chain_va; \
 })
 
-uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)) _transit0()
+uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)) KP_TRANSIT_ATTR _transit0()
 {
     hook_chain_t *hook_chain = current_inline_hook_chain();
     if (!hook_chain) return 0;
@@ -372,7 +394,7 @@ extern void _transit0_end();
 // transit4
 typedef uint64_t (*transit4_func_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 
-uint64_t __attribute__((section(".transit4.text"))) __attribute__((__noinline__))
+uint64_t __attribute__((section(".transit4.text"))) __attribute__((__noinline__)) KP_TRANSIT_ATTR
 _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
 {
     hook_chain_t *hook_chain = current_inline_hook_chain();
@@ -408,7 +430,7 @@ extern void _transit4_end();
 // transit8:
 typedef uint64_t (*transit8_func_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 
-uint64_t __attribute__((section(".transit8.text"))) __attribute__((__noinline__))
+uint64_t __attribute__((section(".transit8.text"))) __attribute__((__noinline__)) KP_TRANSIT_ATTR
 _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6,
           uint64_t arg7)
 {
@@ -451,7 +473,7 @@ extern void _transit8_end();
 typedef uint64_t (*transit12_func_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t, uint64_t);
 
-uint64_t __attribute__((section(".transit12.text"))) __attribute__((__noinline__))
+uint64_t __attribute__((section(".transit12.text"))) __attribute__((__noinline__)) KP_TRANSIT_ATTR
 _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6,
            uint64_t arg7, uint64_t arg8, uint64_t arg9, uint64_t arg10, uint64_t arg11)
 {
