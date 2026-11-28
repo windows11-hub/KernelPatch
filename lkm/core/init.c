@@ -2,58 +2,54 @@
 /*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  *
- * KernelPatch LKM entry, "pure KernelPatch" shape.
+ * KernelPatch LKM entry.
  *
- * What this module is now:
+ * What this module is:
  *   - the inline hook engine and its trampoline runtime (hook/)
  *   - symbol resolution and kernel text/memory patching (infra/)
- *   - credential switching (supercall/accctl.c: kp_commit_su / kp_task_su)
+ *   - credential switching (supercall/accctl.c)
  *   - selinux_hook, linked in rather than loaded as a .kpm
  *
- * What was removed and why:
- *   - kpm/  the KPM loader. selinux_hook used to be a .kpm; it is a normal
- *     object in this module now, so nothing needs a runtime loader.
- *   - supercall/  the syscall-45 channel plus dispatch, su and kstorage. With
- *     it goes every syscall-table hook this module used to install.
- *   - supercall/sucompat*  the execve redirect.
- *   - infra/syscall_table.c  only the two items above used it.
+ * Removed on purpose: kpm/ (the KPM loader), supercall/ (the syscall-45 channel,
+ * dispatch, su, kstorage), supercall/sucompat* (the execve redirect) and
+ * infra/syscall_table.c. Nothing here installs a syscall hook any more.
  *
- * Consequence, stated plainly: there is no syscall hook left, and no supercall
- * channel for a manager app to talk to. This module only does inline hooks.
+ * ---- staged bring-up --------------------------------------------------
+ *
+ * Every earlier attempt ended the same way: the kernel died inside a hook
+ * before it could log anything, the watchdog reset the machine, and the only
+ * evidence was "it rebooted". kp_stage turns one all-or-nothing load into a
+ * sequence that can be bisected from outside; the last line in dmesg names the
+ * step that failed.
+ *
+ *   0  patch memory only        (one symbol lookup, no hook, no exec pages)
+ *   1  + accctl                 (selinux_blob_sizes, validated before use)
+ *   2  + hook runtime           (7 lookups, then an allocator probe)
+ *   3  + one trivial inline hook
+ *   4  + CFI bypass + manager scan
+ *   5  + selinux_hook           (full module, the default)
+ *
+ * Each gate is a single "if (kp_stage < N) return 0;" immediately after the
+ * work for stage N-1. The gates are deliberately NOT renumbered or reordered
+ * anywhere else: a previous revision had them out of order, so kp_stage=1 ran
+ * the hook runtime anyway and the bisect was meaningless.
  */
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/moduleparam.h>
 
-/* Staged bring-up.
- *
- * Every earlier attempt ended the same way: the kernel panicked inside a hook
- * before it could log anything, so the watchdog reset and the only evidence was
- * "it rebooted". A module parameter turns that single all-or-nothing load into
- * a sequence of steps that can be bisected from outside:
- *
- *   0  patch memory only                     (one init_mm lookup)
- *   1  + accctl symbol resolve
- *   2  + hook runtime init                   (7 lookups, then an alloc probe)
- *   3  + one trivial inline hook             (proves the hook engine works)
- *   4  + CFI bypass + manager scan
- *   5  + selinux_hook                        (full module)
- *
- * Load with: insmod kernelpatch.ko kp_stage=N
- * Each stage logs a marker before and after, so the last line in dmesg names
- * the step that died. */
-static int kp_stage = 5;
-module_param(kp_stage, int, 0644);
-MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-5 (default 5, full module)");
-
 #include "../include/kp_lkm.h"
 #include "../infra/patch_memory.h"
 #include "../infra/symbol_resolver.h"
-#include <hook.h>
 #include "../hook/hook_runtime.h"
 #include "../manager/manager.h"
 #include "../supercall/accctl.h"
 #include "../infra/secpass.h"
+#include <hook.h>
+
+static int kp_stage = 5;
+module_param(kp_stage, int, 0644);
+MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-5 (default 5, full module)");
 
 /* selinux_hook was Admirepowered/selinux_hook, distributed as a .kpm. It now
  * compiles into kernelpatch.ko: the KPM header macros became plain constants
@@ -61,12 +57,10 @@ MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-5 (default 5, full module)");
  *
  * It answers selinuxfs queries (/sys/fs/selinux/access, /context, the procattr
  * writes, the status reads) with the clean-policy result, so a caller probing
- * for Magisk types gets EINVAL exactly as it would on an unmodified device.
- * That is what kp_selinux_bypass_init() in accctl.c used to fake from the
- * opposite direction; running both would make compute_av and avc_has_perm
- * disagree, so the bypass was deleted when this was linked in. */
+ * for Magisk types gets EINVAL exactly as it would on an unmodified device. */
 extern long selinux_hook_init(const char *args, const char *event, void *__user r);
 extern long selinux_hook_exit(void *__user r);
+
 extern int kp_hook_smoke_test(void);
 
 /*
@@ -102,63 +96,16 @@ __attribute__((naked)) int __init kernelpatch_init_early(void)
 #define NEED_OWN_STACKPROTECTOR 0
 #endif
 
-
-
-/* ---- stage 2: hook engine smoke test ----------------------------------
- *
- * Hooks a kernel function that is effectively never called at runtime, so the
- * trampoline is installed and the text is patched, but nothing executes the
- * hook. That separates two failure modes that both end in a watchdog reset:
- *
- *   - install-time fault: the panic happens during insmod, the marker after
- *     this function never prints, and the log stops right here.
- *   - execution-time fault: install succeeds and the reset only happens once
- *     something actually calls the hooked function.
- *
- * kp_report_unused is a no-op symbol lookup target; if the kernel lacks it the
- * test picks the next candidate. The callback does nothing at all.
- */
-static void kp_smoke_before(hook_fargs0_t *a, void *u)
-{
-    (void)a;
-    (void)u;
-}
-
-int kp_hook_smoke_test(void)
-{
-    static const char *const candidates[] = {
-        "panic_on_oops_show",
-        "reset_devices_show",
-        "sysctl_overload_detect_stack_show",
-        "printk_ratelimit_state",
-    };
-    void *target = NULL;
-    const char *name = NULL;
-    hook_err_t err;
-    unsigned int i;
-
-    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
-        target = kp_resolve_symbol_variant(candidates[i]);
-        if (target) {
-            name = candidates[i];
-            break;
-        }
-    }
-
-    if (!target) {
-        logkw("stage 2: no smoke-test target found, skipping\n");
-        return 0;
-    }
-
-    logki("stage 2: hooking %s at %px\n", name, target);
-    err = hook_wrap(target, 0, (void *)kp_smoke_before, NULL, NULL);
-    logki("stage 2: hook_wrap returned %d\n", err);
-    if (err)
-        return (int)err;
-
-    logki("stage 2: hook installed, target never called by the test\n");
-    return 0;
-}
+/* Every stage logs before and after its work, so a crash leaves the "before"
+ * line as the last thing in the buffer and names the failing step. */
+#define KP_STAGE_ENTER(n, what) logki("stage %d: %s\n", (n), (what))
+#define KP_STAGE_DONE(n)        logki("stage %d: done\n", (n))
+#define KP_STAGE_STOP(n)                                                   \
+	do {                                                               \
+		logki("KernelPatch LKM stopped after stage %d (kp_stage=%d)\n", \
+		      (n), kp_stage);                                      \
+		return 0;                                                  \
+	} while (0)
 
 int __init kernelpatch_init(void)
 {
@@ -167,79 +114,70 @@ int __init kernelpatch_init(void)
 	logki("KernelPatch LKM loading (version %x, kernel %x, stage %d)\n",
 	      kpver, (unsigned)LINUX_VERSION_CODE, kp_stage);
 
-	logki("stage 0: symbol resolver\n");
+	/* ---- stage 0 ---------------------------------------------------- */
+	KP_STAGE_ENTER(0, "symbol resolver");
 	kp_symres_init();
-
-	logki("stage 0: patch memory\n");
+	KP_STAGE_ENTER(0, "patch memory");
 	rc = kp_patch_memory_init();
 	if (rc) {
 		logke("stage 0 failed: patch memory %d\n", rc);
 		return rc;
 	}
-	logki("stage 0 done (patch memory only)\n");
+	KP_STAGE_DONE(0);
+	if (kp_stage < 1)
+		KP_STAGE_STOP(0);
 
-	if (kp_stage < 1) {
-		logki("KernelPatch LKM stopped at stage 0\n");
-		return 0;
-	}
-
-	logki("stage 1: accctl symbol resolve\n");
+	/* ---- stage 1 ---------------------------------------------------- */
+	KP_STAGE_ENTER(1, "accctl (selinux_blob_sizes)");
 	rc = kp_accctl_init();
 	if (rc) {
 		logke("stage 1 failed: accctl %d\n", rc);
 		return rc;
 	}
-	logki("stage 1: accctl done\n");
+	KP_STAGE_DONE(1);
+	if (kp_stage < 2)
+		KP_STAGE_STOP(1);
 
-	if (kp_stage < 5) {
-		logki("KernelPatch LKM stopped at stage 4\n");
-		return 0;
-	}
-
-	logki("stage 2: hook runtime\n");
+	/* ---- stage 2 ---------------------------------------------------- */
+	KP_STAGE_ENTER(2, "hook runtime");
 	rc = kp_hook_runtime_init();
 	if (rc) {
 		logke("stage 2 failed: hook runtime %d\n", rc);
 		return rc;
 	}
-	logki("stage 4 done\n");
+	KP_STAGE_DONE(2);
+	if (kp_stage < 3)
+		KP_STAGE_STOP(2);
 
-	if (kp_stage < 2) {
-		logki("KernelPatch LKM stopped at stage 1\n");
-		return 0;
-	}
-
-	logki("stage 3: smoke hook\n");
+	/* ---- stage 3 ---------------------------------------------------- */
+	KP_STAGE_ENTER(3, "smoke hook");
 	rc = kp_hook_smoke_test();
 	if (rc) {
 		logke("stage 3 failed: smoke hook %d\n", rc);
 		return rc;
 	}
-	logki("stage 2 done\n");
+	KP_STAGE_DONE(3);
+	if (kp_stage < 4)
+		KP_STAGE_STOP(3);
 
-	if (kp_stage < 3) {
-		logki("KernelPatch LKM stopped at stage 2\n");
-		return 0;
-	}
-
-	logki("stage 4: CFI bypass\n");
+	/* ---- stage 4 ---------------------------------------------------- */
+	KP_STAGE_ENTER(4, "CFI bypass");
 	rc = kp_bypass_kcfi();
 	if (rc)
 		logkw("stage 4: CFI bypass failed: %d (continuing)\n", rc);
 
-	logki("stage 4: manager scan\n");
+	KP_STAGE_ENTER(4, "manager scan");
 	kp_manager_init();
-	logki("stage 3 done\n");
+	KP_STAGE_DONE(4);
+	if (kp_stage < 5)
+		KP_STAGE_STOP(4);
 
-	if (kp_stage < 4) {
-		logki("KernelPatch LKM stopped at stage 3\n");
-		return 0;
-	}
-
-	logki("stage 5: selinux_hook\n");
+	/* ---- stage 5 ---------------------------------------------------- */
+	KP_STAGE_ENTER(5, "selinux_hook");
 	rc = (int)selinux_hook_init(NULL, "lkm", NULL);
 	if (rc)
 		logkw("stage 5: selinux_hook init failed: %d\n", rc);
+	KP_STAGE_DONE(5);
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
