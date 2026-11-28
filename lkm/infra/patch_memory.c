@@ -73,26 +73,64 @@
  * but kallsyms_lookup_name reaches it. */
 static uint64_t *kp_swapper_pg_dir;
 
-/* Detect the dcache flush API: android13-5.10 backported dcache_clean_inval_poc,
- * android12-5.10 still has __flush_dcache_area. Kbuild sets KP_NEW_DCACHE_FLUSH. */
-#ifndef KP_NEW_DCACHE_FLUSH
-#define KP_NEW_DCACHE_FLUSH 0
-#endif
-#if KP_NEW_DCACHE_FLUSH
-#define kp_flush_dcache(start, sz)                                                    \
-	do {                                                                          \
-		unsigned long __s = (unsigned long)(start);                            \
-		dcache_clean_inval_poc(__s, __s + (sz));                               \
-	} while (0)
-#define kp_flush_icache(start, end)                                                    \
-	do {                                                                          \
-		unsigned long __s = (unsigned long)(start);                            \
-		caches_clean_inval_pou(__s, (end));                                    \
-	} while (0)
-#else
-#define kp_flush_dcache(start, sz) __flush_dcache_area((void *)(start), (sz))
-#define kp_flush_icache(start, end) __flush_icache_range((start), (end))
-#endif
+/* Cache maintenance, done from inline asm.
+ *
+ * arch/arm64/mm/cache.S defines caches_clean_inval_pou, dcache_clean_inval_poc,
+ * __flush_dcache_area and friends, and exports NONE of them - the file has no
+ * EXPORT_SYMBOL at all, and <asm/cacheflush.h> only carries extern prototypes.
+ * A module that calls them therefore fails to load.
+ *
+ * These are three-instruction sequences, so do them here. They operate on
+ * virtual addresses and follow the same DC/IC + DSB/ISB ordering the kernel
+ * uses in cache.S: maintenance by VA to the point of coherency for the data
+ * side, and to the point of unification for the instruction side, then a
+ * barrier so the CPU cannot execute stale instructions.
+ *
+ * CWAY/CWZ are read from CTR_EL0 at runtime rather than assumed: the line
+ * sizes are implementation-defined and wrong sizes silently leave stale lines.
+ */
+static inline unsigned long kp_ctr_dcache_line(void)
+{
+	unsigned long ctr;
+
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	return 4UL << ((ctr >> 16) & 0xf);
+}
+
+static inline unsigned long kp_ctr_icache_line(void)
+{
+	unsigned long ctr;
+
+	asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+	return 4UL << (ctr & 0xf);
+}
+
+/* Clean and invalidate data cache over [start, end) to the point of
+ * coherency, so the kernel's next read sees what we wrote. */
+static void kp_flush_dcache(unsigned long start, unsigned long end)
+{
+	unsigned long line = kp_ctr_dcache_line();
+	unsigned long a;
+
+	asm volatile("dsb ishst" ::: "memory");
+	for (a = start & ~(line - 1); a < end; a += line)
+		asm volatile("dc civac, %0" :: "r"(a) : "memory");
+	asm volatile("dsb ish" ::: "memory");
+}
+
+/* Invalidate the instruction cache over [start, end) to the point of
+ * unification, then synchronise so no stale instruction can execute. */
+static void kp_flush_icache(unsigned long start, unsigned long end)
+{
+	unsigned long line = kp_ctr_icache_line();
+	unsigned long a;
+
+	asm volatile("dsb ishst" ::: "memory");
+	for (a = start & ~(line - 1); a < end; a += line)
+		asm volatile("ic ivau, %0" :: "r"(a) : "memory");
+	asm volatile("dsb ish" ::: "memory");
+	asm volatile("isb" ::: "memory");
+}
 
 /*
  * Walk from the swapper pgd to the leaf entry covering @va.
