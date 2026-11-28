@@ -45,6 +45,14 @@ struct selinux_load_state;
 extern int __must_check compat_copy_to_user(void __user *to, const void *from, int n);
 extern long compat_strncpy_from_user(char *dest, const char __user *src, long count);
 
+/* kp_current_uid() returns kuid_t (a struct wrapper since 3.5). KernelPatch's
+ * kputils.c wraps it into a plain uid_t, but that declaration lives in
+ * kputils.h which cannot be included here, so do the unwrap inline. */
+static inline uid_t kp_current_uid(void)
+{
+    return __kuid_val(current_uid());
+}
+
 /* KernelPatch runtime symbols that <common.h> declares. That header cannot be
  * included here: it also declares the kpimg link-time markers (_kp_start,
  * _kp_text_start, _kp_hook_start, ...) which only exist inside the packed
@@ -118,6 +126,9 @@ static inline const char *kp_task_comm(const struct task_struct *tsk)
 #define SEL_WRITE_OP_CONTEXT 5
 #define SEL_WRITE_OP_ACCESS 6
 #define SELINUX_STATUS_SIZE 20
+/* Status page version written into the mmap'd selinux_status header. Matches
+ * SELINUX_KERNEL_STATUS_VERSION in security/selinux/status.c. */
+#define SELINUX_KERNEL_STATUS_VERSION 4
 #define SELINUX_STATUS_CLEAN_SEQUENCE 4
 #define SELINUX_STATUS_CLEAN_POLICYLOAD 1
 #define APATCH_MANAGER_PACKAGE "me.bmax.apatch"
@@ -595,7 +606,7 @@ typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
 typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
 static raw_spin_lock_fn_t g_raw_spin_lock_fn;
 static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
-static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
+static raw_spinlock_t g_scopes_lock = { { 0 } };
 
 static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
@@ -939,7 +950,7 @@ static bool clean_policydb_redirect_supported(void)
 static bool current_is_policy_manager(void)
 {
     const char *comm = current_comm();
-    uid_t uid = current_uid();
+    uid_t uid = kp_current_uid();
 
     /* 4.9 only / 仅 4.9：APatch UI 用 UID 放行，避免误拦管理器自身查询。 */
     if (selinux_49_compat_path()) {
@@ -1286,7 +1297,10 @@ static void resolve_required_symbols_once(void)
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
-        on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
+        {
+        kallsyms_on_each_symbol_nomod_fn fn = (kallsyms_on_each_symbol_nomod_fn)(void *)&kallsyms_on_each_symbol;
+        on_each_symbol = fn;
+    }
         walk_rc = on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
@@ -2275,7 +2289,7 @@ static size_t token_len(const char *s)
     return i;
 }
 
-static const char *skip_spaces(const char *s)
+static const char *kp_skip_spaces(const char *s)
 {
     while (s && (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t'))
         s++;
@@ -2342,7 +2356,7 @@ static bool clean_context_token_exists(const char *ctx, size_t len)
 
 static bool clean_context_exists(const char *query)
 {
-    query = skip_spaces(query);
+    query = kp_skip_spaces(query);
     return clean_context_token_exists(query, token_len(query));
 }
 
@@ -2363,7 +2377,7 @@ static bool token_eq_lit(const char *token, size_t len, const char *lit)
 
 static bool context_token_matches(const char *query, const char *lit)
 {
-    const char *ctx = skip_spaces(query);
+    const char *ctx = kp_skip_spaces(query);
 
     return token_eq_lit(ctx, token_len(ctx), lit);
 }
@@ -2424,10 +2438,10 @@ static bool dirtysepolicy_context_should_hide(const char *query)
 
 static const char *next_token(const char *s)
 {
-    s = skip_spaces(s);
+    s = kp_skip_spaces(s);
     while (s && *s && *s != ' ' && *s != '\n' && *s != '\r' && *s != '\t')
         s++;
-    return skip_spaces(s);
+    return kp_skip_spaces(s);
 }
 
 static bool clean_access_contexts_exist(const char *query)
@@ -2437,7 +2451,7 @@ static bool clean_access_contexts_exist(const char *query)
     size_t src_len;
     size_t dst_len;
 
-    src = skip_spaces(query);
+    src = kp_skip_spaces(query);
     src_len = token_len(src);
     if (!clean_context_token_exists(src, src_len))
         return false;
@@ -2456,7 +2470,7 @@ static bool access_contexts_match(const char *query, const char *src_lit,
     const char *src;
     const char *dst;
 
-    src = skip_spaces(query);
+    src = kp_skip_spaces(query);
     dst = next_token(src);
 
     return token_eq_lit(src, token_len(src), src_lit) &&
@@ -2470,7 +2484,7 @@ static bool access_query_matches3(const char *query, const char *src_lit,
     const char *dst;
     const char *tclass;
 
-    src = skip_spaces(query);
+    src = kp_skip_spaces(query);
     dst = next_token(src);
     tclass = next_token(dst);
 
@@ -2522,7 +2536,7 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
     if (!query || !len)
         return false;
 
-    src = skip_spaces(query);
+    src = kp_skip_spaces(query);
     dst = next_token(src);
 
     /*
@@ -2845,7 +2859,7 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
     if (!query || !out_sid)
         return -EINVAL;
 
-    ctx = skip_spaces(query);
+    ctx = kp_skip_spaces(query);
     len = token_len(ctx);
     if (!len)
         return -EINVAL;
@@ -2960,7 +2974,7 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
 {
     void *policydb = (void *)a->arg0;
     void *clean_policydb = READ_ONCE(g_clean_policydb);
-    bool bypass = should_bypass_clean_filter(current_uid());
+    bool bypass = should_bypass_clean_filter(kp_current_uid());
 
     if (!clean_policydb_redirect_supported())
         return;
@@ -3092,10 +3106,10 @@ static void before_context_struct_compute_av_legacy(hook_fargs5_t *a, void *u)
 /* Hook: /sys/fs/selinux/access write handler */
 static void before_sel_write_access(hook_fargs4_t *a, void *u)
 {
-    // if (current_uid() < 10000 || current_is_policy_manager()) {
+    // if (kp_current_uid() < 10000 || current_is_policy_manager()) {
     //     return; 
     // }
-    // pr_info("[selinux_hook] before_sel_write_access called uid=%u\n", current_uid());
+    // pr_info("[selinux_hook] before_sel_write_access called uid=%u\n", kp_current_uid());
     const char *query = (const char *)a->arg1;
     size_t size = (size_t)a->arg2;
     size_t sample_len;
@@ -3108,7 +3122,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     a->local.data1 = 0;
     a->local.data2 = 0;
 
-    uid = current_uid();
+    uid = kp_current_uid();
     sample_len = copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid)) {
@@ -3248,7 +3262,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     a->local.data1 = 0;
     a->local.data2 = 0;
 
-    uid = current_uid();
+    uid = kp_current_uid();
     sample_len = copy_query_sample(sample, query, size);
 
     if (should_bypass_clean_filter(uid)) {
@@ -3734,7 +3748,7 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
      * DirtySepolicy probes while allowing manager/root callers through.
      */
     if (selinux_49_compat_path()) {
-        uid = current_uid();
+        uid = kp_current_uid();
         manager = (uid < 10000) || current_is_policy_manager();
         if (!manager && (dirtysepolicy_context_should_hide(sample) ||
                          legacy_should_block_access_query(sample, sample_len)))
@@ -3766,7 +3780,7 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     }
     blocked = !manager && clean_ret == -EINVAL;
 
-    uid = current_uid();
+    uid = kp_current_uid();
     n = READ_ONCE(g_procattr_current_count) + 1;
     WRITE_ONCE(g_procattr_current_count, n);
 
@@ -3792,7 +3806,7 @@ static void before_security_setprocattr(hook_fargs4_t *a, void *u)
         n++;
         WRITE_ONCE(g_setprocattr_probe_count, n);
         pr_info("[selinux_hook] PROBE security_setprocattr4 #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%px arg3=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
+                n, kp_current_uid(), current_comm(), (void *)a->arg0,
                 (void *)a->arg1, (void *)a->arg2, size);
     }
 
@@ -3836,7 +3850,7 @@ static void before_task_setprocattr_49(hook_fargs4_t *a, const char *hook,
         n++;
         WRITE_ONCE(*counter, n);
         pr_info("[selinux_hook] PROBE %s #%u uid=%d comm=%s task=%px arg1=%px arg2=%px arg3=%zu\n",
-                hook, n, current_uid(), current_comm(), (void *)a->arg0,
+                hook, n, kp_current_uid(), current_comm(), (void *)a->arg0,
                 (void *)a->arg1, (void *)a->arg2, size);
     }
 
@@ -3875,7 +3889,7 @@ static void before_security_setprocattr_legacy(hook_fargs3_t *a, void *u)
         n++;
         WRITE_ONCE(g_setprocattr_probe_count, n);
         pr_info("[selinux_hook] PROBE security_setprocattr3 #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
+                n, kp_current_uid(), current_comm(), (void *)a->arg0,
                 (void *)a->arg1, size);
     }
 
@@ -3899,7 +3913,7 @@ static void before_selinux_setprocattr(hook_fargs3_t *a, void *u)
         n++;
         WRITE_ONCE(g_selinux_setprocattr_probe_count, n);
         pr_info("[selinux_hook] PROBE selinux_setprocattr #%u uid=%d comm=%s arg0=%px arg1=%px arg2=%zu\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
+                n, kp_current_uid(), current_comm(), (void *)a->arg0,
                 (void *)a->arg1, size);
     }
 
@@ -4000,7 +4014,7 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
     n = READ_ONCE(g_status_read_count) + 1;
     WRITE_ONCE(g_status_read_count, n);
     selinux_hook_dbg("[selinux_hook] STATUS mmap patch #%u uid=%d comm=%s vm_start=%lx seq=%u pload=%u\n",
-                     n, current_uid(), current_comm(), vm_start,
+                     n, kp_current_uid(), current_comm(), vm_start,
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
 }
@@ -4036,7 +4050,7 @@ static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u)
 }
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 {
-    uid_t uid = current_uid();
+    uid_t uid = kp_current_uid();
     ssize_t ret;
     u32 n;
     u32 probe;
@@ -4172,7 +4186,7 @@ static void before_simple_read_from_buffer(hook_fargs5_t *a, void *u)
     WRITE_ONCE(g_status_redirect_count, n);
     if (n <= 16)
         pr_info("[selinux_hook] STATUS v3 simple_read patch #%u uid=%d comm=%s to=%px count=%zu ppos=%px from=%px available=%zu old=%u,%u,%u,%u,%u clean=%u,%u,%u,%u,%u bytes=%02x %02x %02x %02x\n",
-                n, current_uid(), current_comm(), (void *)a->arg0,
+                n, kp_current_uid(), current_comm(), (void *)a->arg0,
                 (size_t)a->arg1, (void *)a->arg2, from,
                 (size_t)a->arg4,
                 get_u32_le((unsigned char *)&a->local.data2 + 0),
@@ -4214,8 +4228,8 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
     if (!snapshot || !len || !out_data || !out_len)
         return;
     if (current_is_policy_manager()) {
-        if (should_log_live_bypass(current_uid()))
-            log_bypass_once("policy", current_uid(), NULL);
+        if (should_log_live_bypass(kp_current_uid()))
+            log_bypass_once("policy", kp_current_uid(), NULL);
         return;
     }
 
@@ -4241,7 +4255,7 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
     a->skip_origin = 1;
     a->ret = 0;
     selinux_hook_dbg("[selinux_hook] CLEAN /sys/fs/selinux/policy read #%u uid=%d comm=%s blob=%px copy=%px len=%zu\n",
-                     n, current_uid(), current_comm(), snapshot, copy, len);
+                     n, kp_current_uid(), current_comm(), snapshot, copy, len);
 }
 
 /* Hook: /sys/fs/selinux/policy read backend, security_read_policy(data, len) */
