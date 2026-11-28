@@ -1261,6 +1261,25 @@ static int cache_symbol_cb(void *data, const char *name,
     return 0;
 }
 
+/* kallsyms_on_each_symbol's signature changed in 6.4: it gained a
+ * struct module *mod argument (v6.4-rc1, "kallsyms: add module param").
+ * Calling the symbol directly therefore only compiles on one side of that
+ * change, so go through a pointer and dispatch on kver. */
+typedef int (*kallsyms_walk_2_fn)(int (*fn)(void *, const char *, unsigned long), void *data);
+typedef int (*kallsyms_walk_3_fn)(int (*fn)(void *, const char *, unsigned long), void *data,
+                                  struct module *mod);
+
+static int kallsyms_walk(int (*fn)(void *, const char *, unsigned long), void *data)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    kallsyms_walk_3_fn f = (kallsyms_walk_3_fn)(void *)&kallsyms_on_each_symbol;
+    return f(fn, data, NULL);
+#else
+    kallsyms_walk_2_fn f = (kallsyms_walk_2_fn)(void *)&kallsyms_on_each_symbol;
+    return f(fn, data);
+#endif
+}
+
 static int cache_symbol_cb_nomod(void *data, const char *name, unsigned long addr)
 {
     (void)data;
@@ -1305,7 +1324,7 @@ static void resolve_required_symbols_once(void)
             }
         }
     } else if (kver <= VERSION(6, 1, 0)) {
-        walk_rc = kallsyms_on_each_symbol(cache_symbol_cb, NULL);
+        walk_rc = kallsyms_walk(cache_symbol_cb, NULL);
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
