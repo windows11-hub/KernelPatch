@@ -82,8 +82,12 @@ int kp_accctl_init(void)
 	}
 	logki("selinux_blob_sizes at %px\n", addr);
 
-	if (!virt_addr_valid(addr)) {
-		logkw("selinux_blob_sizes=%px is not a valid kernel address; translabel disabled\n", addr);
+	/* virt_addr_valid() pulls in pfn_is_map_memory, which this kernel does not
+	 * export; the loader rejects the module over it. Bracket the kernel image
+	 * address space instead - that rejects stack, vmalloc and user pointers,
+	 * which is all this check needs to do. */
+	if ((unsigned long)addr < 0xffffff8000000000UL) {
+		logkw("selinux_blob_sizes=%px is not a kernel address; translabel disabled\n", addr);
 		return 0;
 	}
 
