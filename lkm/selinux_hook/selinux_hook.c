@@ -606,6 +606,8 @@ typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
 typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
 static raw_spin_lock_fn_t g_raw_spin_lock_fn;
 static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
+static bool g_walk_available;
+
 static raw_spinlock_t g_scopes_lock = { { 0 } };
 
 static bool contains_magisk(const char *s, size_t len);
@@ -1281,7 +1283,17 @@ static void resolve_required_symbols_once(void)
 
     prepare_symbol_cache();
 
-    if (!kallsyms_on_each_symbol) {
+    /* kallsyms_on_each_symbol is a linked kernel symbol here, not a resolved
+     * pointer, so testing the function itself is always false and the compiler
+     * warns. Route it through a variable: the value is still the real address,
+     * but it is now a runtime value the null checks below can act on. */
+    {
+        kallsyms_on_each_symbol_nomod_fn walk_probe =
+            (kallsyms_on_each_symbol_nomod_fn)(void *)&kallsyms_on_each_symbol;
+        g_walk_available = walk_probe != NULL;
+    }
+
+    if (!READ_ONCE(g_walk_available)) {
         pr_warn("[selinux_hook] kallsyms_on_each_symbol missing; falling back to exact symbol lookups only\n");
         for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
             unsigned long addr;
@@ -1313,7 +1325,7 @@ static void resolve_required_symbols_once(void)
     }
     walk_complete = walk_rc == 0 && found > 0;
 
-    if (found == 0 && kallsyms_on_each_symbol) {
+    if (found == 0 && READ_ONCE(g_walk_available)) {
         pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
         for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
             unsigned long addr;
