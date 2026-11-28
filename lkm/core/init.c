@@ -48,6 +48,7 @@ MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-4 (default 4, full module)");
 #include "../include/kp_lkm.h"
 #include "../infra/patch_memory.h"
 #include "../infra/symbol_resolver.h"
+#include <hook.h>
 #include "../hook/hook_runtime.h"
 #include "../manager/manager.h"
 #include "../supercall/accctl.h"
@@ -99,6 +100,64 @@ __attribute__((naked)) int __init kernelpatch_init_early(void)
 #else
 #define NEED_OWN_STACKPROTECTOR 0
 #endif
+
+
+
+/* ---- stage 2: hook engine smoke test ----------------------------------
+ *
+ * Hooks a kernel function that is effectively never called at runtime, so the
+ * trampoline is installed and the text is patched, but nothing executes the
+ * hook. That separates two failure modes that both end in a watchdog reset:
+ *
+ *   - install-time fault: the panic happens during insmod, the marker after
+ *     this function never prints, and the log stops right here.
+ *   - execution-time fault: install succeeds and the reset only happens once
+ *     something actually calls the hooked function.
+ *
+ * kp_report_unused is a no-op symbol lookup target; if the kernel lacks it the
+ * test picks the next candidate. The callback does nothing at all.
+ */
+static void kp_smoke_before(hook_fargs0_t *a, void *u)
+{
+    (void)a;
+    (void)u;
+}
+
+int kp_hook_smoke_test(void)
+{
+    static const char *const candidates[] = {
+        "panic_on_oops_show",
+        "reset_devices_show",
+        "sysctl_overload_detect_stack_show",
+        "printk_ratelimit_state",
+    };
+    void *target = NULL;
+    const char *name = NULL;
+    hook_err_t err;
+    unsigned int i;
+
+    for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        target = kp_resolve_symbol_variant(candidates[i]);
+        if (target) {
+            name = candidates[i];
+            break;
+        }
+    }
+
+    if (!target) {
+        logkw("stage 2: no smoke-test target found, skipping\n");
+        return 0;
+    }
+
+    logki("stage 2: hooking %s at %px\n", name, target);
+    err = hook_wrap(target, 0, (void *)kp_smoke_before, NULL, NULL);
+    logki("stage 2: hook_wrap returned %d\n", err);
+    if (err)
+        return (int)err;
+
+    logki("stage 2: hook installed, target never called by the test\n");
+    return 0;
+}
 
 int __init kernelpatch_init(void)
 {
