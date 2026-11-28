@@ -533,6 +533,24 @@ static __noinline hook_err_t relocate_inst(hook_t *hook, uint64_t inst_addr, uin
         }
     }
 
+    /*
+     * Refuse to write past the buffer.
+     *
+     * Each relo_* helper writes @len words at relo_insts + relo_insts_num with
+     * no bound of its own, and hook_prepare() appends a jump-back branch after
+     * the last of them. RELOCATE_INST_NUM now leaves room for the worst case
+     * plus that branch, but a future instruction pattern could still exceed it,
+     * and overrunning here corrupts chain_items_max / transit[] silently.
+     * Failing the hook is the correct outcome; corrupting the chain is not.
+     */
+    if (hook->relo_insts_num + len + RELO_JUMPBACK_NUM >
+        (int32_t)(sizeof(hook->relo_insts) / sizeof(hook->relo_insts[0]))) {
+        logkw("relocate_inst: relo buffer full (%d + %d + %d > %d)\n",
+              hook->relo_insts_num, len, RELO_JUMPBACK_NUM,
+              (int)(sizeof(hook->relo_insts) / sizeof(hook->relo_insts[0])));
+        return -HOOK_BAD_RELO;
+    }
+
     switch (it) {
     case INST_B:
     case INST_BC:
@@ -608,8 +626,21 @@ hook_err_t hook_prepare(hook_t *hook)
     // jump back
     uint64_t back_src_addr = hook->relo_addr + hook->relo_insts_num * 4;
     uint64_t back_dst_addr = hook->origin_addr + hook->tramp_insts_num * 4;
-    uint32_t *buf = hook->relo_insts + hook->relo_insts_num;
+    int32_t relo_cap = (int32_t)(sizeof(hook->relo_insts) / sizeof(hook->relo_insts[0]));
+    uint32_t *buf;
+
+    if (hook->relo_insts_num + RELO_JUMPBACK_NUM > relo_cap) {
+        logkw("hook_prepare: no room for jump back (%d + %d > %d)\n",
+              hook->relo_insts_num, RELO_JUMPBACK_NUM, relo_cap);
+        return -HOOK_BAD_RELO;
+    }
+    buf = hook->relo_insts + hook->relo_insts_num;
     hook->relo_insts_num += branch_from_to(buf, back_src_addr, back_dst_addr);
+    if (hook->relo_insts_num > relo_cap) {
+        logkw("hook_prepare: branch_from_to overran (%d > %d)\n",
+              hook->relo_insts_num, relo_cap);
+        return -HOOK_BAD_RELO;
+    }
     return HOOK_NO_ERR;
 }
 KP_EXPORT_SYMBOL(hook_prepare);
