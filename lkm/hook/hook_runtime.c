@@ -22,6 +22,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/stop_machine.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -141,26 +142,78 @@ void hook_mem_free(void *payload)
 	mutex_unlock(&kp_hook_lock);
 }
 
-int hotpatch(void *addrs[], uint32_t values[], int count)
-{
-	int i, start, rc;
+/*
+ * Write trampoline instructions into kernel text.
+ *
+ * This MUST run under stop_machine. Every other CPU is still executing the
+ * function being patched, and rewriting four bytes of its prologue while a
+ * different core is mid-prefetch gives that core a half-old, half-new
+ * instruction stream. The result is an undefined-instruction fault, which with
+ * CONFIG_PANIC_ON_OOPS=y and CONFIG_PANIC_TIMEOUT=-1 becomes an immediate
+ * panic and a hypervisor watchdog reset - exactly what this module kept doing.
+ *
+ * The kernel's own aarch64_insn_patch_text() does the same thing:
+ *
+ *   return stop_machine_cpuslocked(aarch64_insn_patch_text_cb, &patch, ...);
+ *
+ * stop_machine is EXPORT_SYMBOL_GPL in kernel/stop_machine.c, so a GPL module
+ * may call it. The callback runs on one CPU with the others parked.
+ */
+struct kp_hotpatch_req {
+	void **addrs;
+	uint32_t *values;
+	int count;
+	int rc;
+};
 
-	for (start = 0; start < count; start = i) {
-		for (i = start + 1; i < count; i++) {
-			if ((char *)addrs[i] != (char *)addrs[start] +
-						 (i - start) * sizeof(values[0]))
+/* Runs on the stopper CPU: nobody else is executing while this is in here. */
+static int kp_hotpatch_cb(void *arg)
+{
+	struct kp_hotpatch_req *req = arg;
+	int i, start;
+
+	for (start = 0; start < req->count; start = i) {
+		/* Batch physically adjacent writes into one patch so fewer PTE
+		 * flips and flushes are needed. */
+		for (i = start + 1; i < req->count; i++) {
+			if ((char *)req->addrs[i] != (char *)req->addrs[start] +
+						     (i - start) * sizeof(req->values[0]))
 				break;
 		}
-		rc = kp_patch_text(addrs[start], &values[start],
-				   (i - start) * sizeof(values[0]),
-				   KP_PATCH_TEXT_FLUSH_DCACHE | KP_PATCH_TEXT_FLUSH_ICACHE);
-		if (rc) {
+		req->rc = kp_patch_text(req->addrs[start], &req->values[start],
+					(i - start) * sizeof(req->values[0]),
+					KP_PATCH_TEXT_FLUSH_DCACHE |
+					KP_PATCH_TEXT_FLUSH_ICACHE);
+		if (req->rc) {
 			logke("hotpatch: patch_text(%px, %d words) failed: %d\n",
-			      addrs[start], i - start, rc);
-			return rc;
+			      req->addrs[start], i - start, req->rc);
+			return req->rc;
 		}
 	}
 	return 0;
+}
+
+int hotpatch(void *addrs[], uint32_t values[], int count)
+{
+	struct kp_hotpatch_req req = {
+		.addrs = addrs,
+		.values = values,
+		.count = count,
+		.rc = 0,
+	};
+	int rc;
+
+	if (!addrs || !values || count <= 0)
+		return -EINVAL;
+
+	/* stop_machine() may fail (e.g. called from a context that cannot park
+	 * CPUs). Refusing is correct: patching text without it is the crash. */
+	rc = stop_machine(kp_hotpatch_cb, &req, NULL);
+	if (rc) {
+		logke("hotpatch: stop_machine failed: %d\n", rc);
+		return rc;
+	}
+	return req.rc;
 }
 
 void flush_icache_all(void)
