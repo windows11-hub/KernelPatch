@@ -28,6 +28,7 @@
 struct selinux_load_state;
 #include <ksyms.h>
 #include <hook.h>
+#include <kp_call.h>
 
 /* <kpmodule.h> and <kputils.h> are deliberately not included.
  *
