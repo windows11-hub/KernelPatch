@@ -42,6 +42,24 @@ struct selinux_load_state;
  * correct. */
 extern int __must_check compat_copy_to_user(void __user *to, const void *from, int n);
 
+/* KernelPatch runtime symbols that <common.h> declares. That header cannot be
+ * included here: it also declares the kpimg link-time markers (_kp_start,
+ * _kp_text_start, _kp_hook_start, ...) which only exist inside the packed
+ * kernel image, not in a loadable module. Only these two are used. */
+#define VERSION(major, minor, patch) (((major) << 16) + ((minor) << 8) + (patch))
+extern uint32_t kver;
+
+/* Same story for the task_struct field offsets: KernelPatch carries them as
+ * runtime-resolved globals (task_struct_offset etc.), declared in kputils.h
+ * which drags in the userland compiler shims. */
+extern int task_struct_offset;
+
+/* <linux/sched.h> provides get_task_comm() only from 5.10 on; older trees
+ * expose it as a macro over __get_task_comm. */
+#ifndef get_task_comm
+#define get_task_comm(buf, tsk) __get_task_comm(buf, sizeof(buf), tsk)
+#endif
+
 /* Uplifted from KPM to a statically linked KernelPatch component.
  *
  * KPM_NAME/KPM_VERSION/KPM_LICENSE/KPM_AUTHOR/KPM_DESCRIPTION and the
@@ -324,6 +342,15 @@ struct avtab_key {
 #define AVTAB_XPERMS (AVTAB_XPERMS_ALLOWED | AVTAB_XPERMS_AUDITALLOW | AVTAB_XPERMS_DONTAUDIT)
 #define AVTAB_XPERMS_IOCTLFUNCTION 0x01
 #define AVTAB_XPERMS_IOCTLDRIVER 0x02
+
+/* SELinux stores ioctl permission bits in a fixed 8-x-32 bitmap. The kernel
+ * header declares it in security/selinux/ss/avtab.h, which the LKM build cannot
+ * reach, so mirror it here. The size matters: avtab_extended_perms embeds it by
+ * value and the kernel reads those bytes. */
+#define EXTENDED_PERMS_LEN 8
+struct extended_perms_data {
+    u32 p[EXTENDED_PERMS_LEN];
+};
 
 struct avtab_extended_perms {
     u8 specified;
