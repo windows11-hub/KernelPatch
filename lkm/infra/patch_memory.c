@@ -344,26 +344,66 @@ static unsigned long kp_phys_from_virt(unsigned long addr)
 	}
 }
 
+/* Write @len bytes into kernel memory that may be mapped read-only.
+ *
+ * This used to go through set_fixmap_offset(FIX_TEXT_POKE0, ...) and
+ * copy_to_kernel_nofault(). Neither is usable in a module on this kernel:
+ *
+ *   __set_fixmap            defined in arch/arm64/mm/fixmap.c, NOT exported
+ *   copy_to_kernel_nofault  defined in mm/maccess.c,           NOT exported
+ *
+ * Both are referenced by the macros above, so even naming them compiles into
+ * undefined symbols and the loader refuses the module.
+ *
+ * The page tables are ours to walk anyway (kp_leaf_of already does it for the
+ * executable mapping), so do it here: find the leaf entry covering @dst,
+ * temporarily set PTE_DBM and clear PTE_RDONLY, write the bytes, then put the
+ * original protection back and flush the TLB. That is the same sequence the
+ * kernel's own patch_mapping() uses, and it needs no helpers at all.
+ */
 __attribute__((no_sanitize("cfi")))
 static int kp_patch_data(void *dst, const void *src, size_t len)
 {
-	unsigned long phy = kp_phys_from_virt((unsigned long)dst);
-	unsigned long phy_off;
-	void *map;
-	int ret;
+	unsigned long addr = (unsigned long)dst;
+	unsigned long off = addr & ~PAGE_MASK;
+	uint64_t *ent = NULL;
+	enum kp_leaf_level lvl;
+	uint64_t orig;
+	uint64_t tmp;
 
-	if (!phy) {
-		logke("no phys for data patch dst 0x%lx\n", (unsigned long)dst);
+	if (!dst || !len)
+		return -EINVAL;
+
+	lvl = kp_leaf_of(addr, &ent);
+	if (lvl != KP_LEAF_PTE || !ent) {
+		/* Only PTE leaves are patched. A block mapping would need the whole
+		 * 2M/1G page to be split first, which this module never has to do:
+		 * the targets are vmalloc pages and small .rodata tables. */
+		logke("patch_data: no PTE for %px\n", dst);
 		return -ENOENT;
 	}
 
-	phy_off = phy & ~PAGE_MASK;
-	map = (void *)set_fixmap_offset(FIX_TEXT_POKE0, phy & PAGE_MASK) + phy_off;
-	ret = (int)copy_to_kernel_nofault(map, src, len);
-	clear_fixmap(FIX_TEXT_POKE0);
-	if (!ret)
-		kp_flush_dcache((unsigned long)dst, len);
-	return ret;
+	orig = READ_ONCE(*ent);
+
+	/* Writable + dirty at EL1. DBM=1 with RDONLY=0 is the arm64 hardware
+	 * dirty-bit way to allow stores; it is what the kernel's set_memory_rw
+	 * ends up doing on a PTE. */
+	tmp = (orig | KP_PTE_DBM) & ~KP_PTE_RDONLY;
+	tmp |= KP_PTE_UXN;		/* keep EL0 out of it */
+	set_pte((pte_t *)ent, __pte(tmp));
+	flush_tlb_kernel_range(addr & PAGE_MASK, (addr & PAGE_MASK) + PAGE_SIZE);
+	dsb(ish);
+
+	memcpy((void *)(addr & PAGE_MASK) + off, src, len);
+
+	/* Put the original protection back and flush again so no stale writable
+	 * translation survives on any CPU. */
+	set_pte((pte_t *)ent, __pte(orig));
+	flush_tlb_kernel_range(addr & PAGE_MASK, (addr & PAGE_MASK) + PAGE_SIZE);
+	dsb(ish);
+
+	kp_flush_dcache(addr, addr + len);
+	return 0;
 }
 
 int kp_patch_memory_init(void)
