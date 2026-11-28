@@ -41,7 +41,26 @@ typedef int8_t chain_item_state;
 
 #define HOOK_MEM_REGION_NUM 4
 #define TRAMPOLINE_MAX_NUM 6
-#define RELOCATE_INST_NUM (4 * 8 + 8 - 4)
+/*
+ * relo_insts capacity.
+ *
+ * Worst case, measured against the expansion lengths in hook.c:
+ *   relo_ignore 2, relo_cb 6, relo_tb 6, relo_ldr 4..6, relo_adr 4..6,
+ *   relo_b 1/4/6
+ * so 6 relocated instructions can produce 6*6 = 36 words, and hook_prepare()
+ * then appends the "jump back" branch at the end, which is another 4..6.
+ *
+ * The previous value was (4*8+8-4) = exactly 36, i.e. no room for the jump
+ * back at all. Overrunning it wrote past the end of hook->relo_insts into the
+ * next fields of hook_chain_t - chain_items_max, states[], udata[], befores[],
+ * afters[] and finally transit[] itself. A corrupted chain_items_max makes
+ * hook_chain_add walk garbage slots and call whatever pointer it finds, and a
+ * corrupted transit[] means the trampoline is destroyed before it is even
+ * installed. That is a silent memory-corruption path, not a clean failure.
+ */
+#define RELOCATE_INST_MAX_EXPANSION 6
+#define RELO_JUMPBACK_NUM 6
+#define RELOCATE_INST_NUM (TRAMPOLINE_MAX_NUM * RELOCATE_INST_MAX_EXPANSION + RELO_JUMPBACK_NUM)
 
 #define HOOK_CHAIN_NUM 0x10
 /* GCC 14 emits a ~100-instruction _transit12 (12-arg hook chain); 0x60 left it
