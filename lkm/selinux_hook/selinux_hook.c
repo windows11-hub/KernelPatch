@@ -3453,21 +3453,6 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
                      probe->query);
 }
 
-#define SELINUX_PTE_VALID (1UL << 0)
-#define SELINUX_PTE_TABLE_BIT (1UL << 1)
-#define SELINUX_PTE_RDONLY (1UL << 7)
-#define SELINUX_PTE_DBM (1UL << 51)
-#define SELINUX_PTE_CONT (1UL << 52)
-#define SELINUX_CONT_PTES 16
-
-static unsigned long selinux_tlbi_vaddr(unsigned long addr)
-{
-    unsigned long v = addr >> 12;
-
-    v &= ((1UL << 44) - 1);
-    return v;
-}
-
 static int patch_kernel_ulong(void *addr, unsigned long value)
 {
     /* Write a pointer-sized field in kernel memory that the kernel mapped
