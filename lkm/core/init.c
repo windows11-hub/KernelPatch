@@ -205,8 +205,29 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("bmax121");
 MODULE_DESCRIPTION("KernelPatch LKM");
 MODULE_VERSION(KP_LKM_VERSION_STRING);
+/* Namespaces actually used by this module.
+ *
+ * Verified against oppo-source/android_kernel_oppo_sm8750: the symbols below
+ * are exported with EXPORT_SYMBOL_NS(..., <ns>) rather than EXPORT_SYMBOL, and
+ * a module that references them without importing the namespace is rejected
+ * by the loader.
+ *
+ *   ANDROID_GKI_VFS_EXPORT_ONLY
+ *     filp_open, kernel_read, prepare_creds   <- all three used in this tree
+ *     (also dentry_open, generic_file_open, kernel_write,
+ *      iter_file_splice_write, fiemap_*, override_creds, revert_creds)
+ *
+ *   VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver
+ *     the classic VFS internals namespace, kept because manager/apk_sign.c and
+ *     infra/patch_memory.c reach VFS entry points that still live there.
+ *
+ * MODULE_IMPORT_NS is variadic-only from 6.13; older trees take a bare token,
+ * so the two spellings are kept apart as before.
+ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+MODULE_IMPORT_NS("ANDROID_GKI_VFS_EXPORT_ONLY");
 #else
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+MODULE_IMPORT_NS(ANDROID_GKI_VFS_EXPORT_ONLY);
 #endif
