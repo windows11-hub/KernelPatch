@@ -152,12 +152,27 @@ static bool kp_hook_region_ok(void *p, unsigned long size)
 	 * DC ZVA in __memset ran into the 16K stack guard page (PTE = 0), and the
 	 * resulting Oops escalated to panic and then to a watchdog reset.
 	 *
-	 * object_is_on_stack() is the kernel's own answer to "is this a stack
-	 * address", and it handles VMAP_STACK as well as the older thread_info
-	 * layout. Use it instead of trying to reason about address ranges.
+	 * object_is_on_stack() would be the natural check, but it is a static
+	 * inline over task_stack_page(current) and the compiler proves it false
+	 * for a value returned by an indirect call - the whole test is eliminated
+	 * (verified in the built object: no reference to it survives). Compare
+	 * against the current stack range through a volatile pointer instead, so
+	 * the compiler must keep the comparison.
 	 */
-	if (object_is_on_stack(p))
-		return false;
+	{
+		volatile unsigned long stack_base =
+			(unsigned long)task_stack_page(current);
+		unsigned long limit = stack_base + THREAD_SIZE;
+		unsigned long a2 = a;
+
+		if (a2 >= stack_base && a2 < limit)
+			return false;
+		/* Also reject the guard gap just below and above the stack: a 4K
+		 * memset starting near the top would still cross into the guard
+		 * page, which has no PTE. */
+		if (a2 + size > stack_base && a2 < limit)
+			return false;
+	}
 
 	/* Also reject the module image itself and any other kernel text/data the
 	 * allocator should never have returned. A module_alloc result is always
