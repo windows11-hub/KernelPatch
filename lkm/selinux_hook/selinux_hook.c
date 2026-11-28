@@ -11,7 +11,6 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/sched/task.h>
-#include <linux/percpu.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
@@ -69,21 +68,23 @@ static inline uid_t kp_current_uid(void)
  * returns -ENOEXEC and insmod reports "Exec format error". Per-CPU storage has
  * no such problem, and every caller uses the result immediately as a printf
  * argument, so one buffer per CPU is enough. */
-static DEFINE_PER_CPU(char[TASK_COMM_LEN], kp_comm_buf);
-
+/* get_task_comm() insists on a real char[TASK_COMM_LEN] array (it has a
+ * BUILD_BUG_ON on the size), which a this_cpu_ptr result no longer is. Read the
+ * field directly instead: the offset is already resolved in
+ * task_struct_offset.comm_offset, and the task lock is not needed for a
+ * best-effort log string. */
 static inline const char *kp_task_comm(const struct task_struct *tsk)
 {
-    char *buf = this_cpu_ptr(kp_comm_buf);
+    const char *comm;
 
-    if (!tsk)
+    if (!tsk || READ_ONCE(task_struct_offset.comm_offset) <= 0)
         return NULL;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
-    get_task_comm(buf, (struct task_struct *)tsk);
-#else
-    __get_task_comm(buf, TASK_COMM_LEN, (struct task_struct *)tsk);
-#endif
-    buf[TASK_COMM_LEN - 1] = '\0';
-    return buf;
+
+    comm = (const char *)((unsigned long)tsk +
+                          (unsigned long)READ_ONCE(task_struct_offset.comm_offset));
+    if (!comm[0])
+        return NULL;
+    return comm;
 }
 
 /* Uplifted from KPM to a statically linked KernelPatch component.
