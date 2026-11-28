@@ -2,9 +2,15 @@
 /*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  *
- * Credential switching and SELinux enforcement bypass. Ported from
- * kernel/patch/common/accctl.c; the ko is KMI-bound so struct cred fields are
- * addressed directly instead of through KP's runtime cred_offset.
+ * Credential switching. Ported from kernel/patch/common/accctl.c; the ko is
+ * KMI-bound so struct cred fields are addressed directly instead of through
+ * KP's runtime cred_offset.
+ *
+ * The SELinux enforcement bypass (avc_denied / slow_avc_audit hooks) that this
+ * header used to declare is gone. selinux_hook answers the same queries from
+ * the opposite direction - it returns the clean-policy result rather than
+ * forcing an allow - and running both would make compute_av and avc_has_perm
+ * disagree, which is exactly the inconsistency signal a detector keys on.
  */
 #ifndef _KP_LKM_ACCCTL_H_
 #define _KP_LKM_ACCCTL_H_
@@ -12,10 +18,6 @@
 
 /* Resolve the SELinux translabel helper at init. */
 int kp_accctl_init(void);
-
-/* Hook avc_denied / slow_avc_audit so a denial for a root-granted uid is
- * decided as an allow and not audited. Must run after kp_hook_runtime_init(). */
-int kp_selinux_bypass_init(void);
 
 /* Grant root to the current task (uid/gid -> to_uid, all caps). */
 int kp_commit_su(uid_t to_uid, const char *sctx);
