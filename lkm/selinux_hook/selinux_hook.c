@@ -52,13 +52,36 @@ extern uint32_t kver;
 /* Same story for the task_struct field offsets: KernelPatch carries them as
  * runtime-resolved globals (task_struct_offset etc.), declared in kputils.h
  * which drags in the userland compiler shims. */
-extern int task_struct_offset;
+/* KernelPatch keeps the resolved offsets in this struct (kputils.h). */
+struct kp_task_struct_offset {
+    int task_in_thread_info_offset;
+    int thread_info_in_task_offset;
+    int comm_offset;
+    int cred_offset;
+    int real_cred_offset;
+    int fs_offset;
+    int files_offset;
+    int pid_offset;
+    int tgid_offset;
+};
+extern struct kp_task_struct_offset task_struct_offset;
 
-/* <linux/sched.h> provides get_task_comm() only from 5.10 on; older trees
- * expose it as a macro over __get_task_comm. */
-#ifndef get_task_comm
-#define get_task_comm(buf, tsk) __get_task_comm(buf, sizeof(buf), tsk)
+/* get_task_comm(tsk) here means "give me the comm string". The kernel spells it
+ * get_task_comm(buf, tsk) from 5.10 on and __get_task_comm(buf, size, tsk)
+ * before that; both need a caller-supplied buffer, so wrap it once. */
+static inline const char *kp_task_comm(const struct task_struct *tsk)
+{
+    static __thread char buf[TASK_COMM_LEN];
+
+    if (!tsk)
+        return NULL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+    get_task_comm(buf, (struct task_struct *)tsk);
+#else
+    __get_task_comm(buf, sizeof(buf), (struct task_struct *)tsk);
 #endif
+    return buf;
+}
 
 /* Uplifted from KPM to a statically linked KernelPatch component.
  *
@@ -444,19 +467,29 @@ struct av_decision {
     u32 flags;
 };
 
-/* Driver-level ioctl xperms: a pointer to an array of
- * EXTENDED_PERMS_LEN bitmaps plus the number of entries. */
+/* Userspace-facing xperms accumulator (security/selinux/include/avc_ss.h).
+ * len is the number of populated driver entries; drivers is a single bitmap
+ * that the services code ORs ioctl permission words into. An anonymous union
+ * lets the services code reach it as xperms->drivers.p without the nested
+ * struct spelling. */
 #define EXTENDED_PERMS_LEN 8
 struct extended_perms {
-    u8 len;                              /* number of p[] entries in use */
-    struct extended_perms_data {
-        u32 p[EXTENDED_PERMS_LEN];
-    } drivers[1];                        /* variable length */
+    u32 len;
+    union {
+        struct extended_perms_data {
+            u32 p[EXTENDED_PERMS_LEN];
+        } drivers;
+        u32 raw[EXTENDED_PERMS_LEN];
+    };
 };
 
+/* security/selinux/include/security.h: what security_load_policy() fills in.
+ * Only ->policy is touched - it is handed to read_policy_sidtab() - so the rest
+ * is spelled out to keep the size right without depending on those names. */
 struct selinux_load_state {
-    struct policydb *policydb;
     void *old_policy;
+    struct selinux_policy *new_policy;
+    struct selinux_policy *policy;      /* this is what the callers read */
     bool policy_changed;
 };
 
@@ -820,7 +853,7 @@ static const char *current_comm(void)
     if (task_struct_offset.comm_offset <= 0)
         return "?";
 
-    return get_task_comm(current) ?: "?";
+    return kp_task_comm(current) ?: "?";
 }
 
 static bool should_bypass_clean_filter(uid_t uid)
