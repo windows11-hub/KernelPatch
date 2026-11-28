@@ -290,63 +290,46 @@ static void kp_hook_flush_all(void)
 
 int kp_hook_runtime_init(void)
 {
-	/* One symbol per line, logged BEFORE and AFTER each lookup.
+	/*
+	 * Resolve only what the OPPO 6.6 kernel actually exports.
 	 *
-	 * This used to be seven lookups and one summary line, so a crash anywhere
-	 * in here produced no evidence at all - the watchdog reset destroyed the
-	 * buffer before anyone could read it. Now the last line in dmesg names the
-	 * exact symbol being resolved when the module dies.
+	 * Verified against oppo-source/android_kernel_oppo_sm8750:
+	 *   __vmalloc_node_range  exported   (vmlinux EXPORT_SYMBOL)
+	 *   vfree                 exported
+	 *   init_mm               NOT exported (mm/init-mm.c has no EXPORT_SYMBOL)
+	 *   module_alloc          NOT exported (__weak, kernel/module/main.c)
+	 *   module_memfree        NOT exported (__weak)
+	 *   set_memory_x          NOT exported (arch/arm64/mm/pageattr.c)
 	 *
-	 * kallsyms_lookup_name() walks the compressed kallsyms tables and can fault
-	 * on a malformed/mismatched table, which is one of the things this staging
-	 * is meant to distinguish from a bad pointer later. */
-#define KP_RESOLVE(dst, name)                                            \
-	do {                                                             \
-		logki("sym: resolving %s\n", name);                      \
-		(dst) = (void *)kp_resolve_symbol(name);                 \
-		logki("sym: %s = %px\n", name, (void *)(dst));            \
-	} while (0)
+	 * init_mm being unavailable is what makes the manual page-table walk in
+	 * kp_hook_clear_exec_bits() a no-op rather than a hazard: the helper
+	 * returns immediately when kp_hook_init_mm is NULL. That is correct - the
+	 * executable mapping now comes from __vmalloc_node_range itself, so no
+	 * second pass over the page tables is needed at all.
+	 */
+	kp_hook_vmalloc_range = (kp_vmalloc_range_t)kp_resolve_symbol("__vmalloc_node_range");
+	kp_hook_module_alloc = (void *)kp_resolve_symbol("module_alloc");
+	kp_hook_module_memfree = (void *)kp_resolve_symbol("module_memfree");
+	kp_hook_execmem_alloc = (void *)kp_resolve_symbol("execmem_alloc");
+	kp_hook_execmem_free = (void *)kp_resolve_symbol("execmem_free");
+	kp_hook_flush_icache_all = (void *)kp_resolve_symbol("flush_icache_all");
+	kp_hook_set_memory_x = (int (*)(unsigned long, int))kp_resolve_symbol("set_memory_x");
+	kp_hook_init_mm = (struct mm_struct *)kp_resolve_symbol("init_mm");
 
-	logki("hook runtime: begin\n");
+	logki("hook runtime: vmalloc_range=%px module_alloc=%px set_memory_x=%px init_mm=%px\n",
+	      (void *)kp_hook_vmalloc_range, (void *)kp_hook_module_alloc,
+	      (void *)kp_hook_set_memory_x, (void *)kp_hook_init_mm);
 
-	KP_RESOLVE(kp_hook_module_alloc, "module_alloc");
-	KP_RESOLVE(kp_hook_module_memfree, "module_memfree");
-	KP_RESOLVE(kp_hook_execmem_alloc, "execmem_alloc");
-	KP_RESOLVE(kp_hook_execmem_free, "execmem_free");
-	KP_RESOLVE(kp_hook_flush_icache_all, "flush_icache_all");
-	KP_RESOLVE(kp_hook_set_memory_x, "set_memory_x");
-	KP_RESOLVE(kp_hook_init_mm, "init_mm");
-
-#undef KP_RESOLVE
-
-	if (!kp_hook_init_mm)
-		logkw("init_mm not found; hook pages keep the GP bit set and BTI will fault\n");
-	if (!kp_hook_module_alloc)
-		logkw("module_alloc not found; using execmem_alloc/vmalloc for hook memory\n");
-	if (!kp_hook_set_memory_x && !kp_hook_execmem_alloc) {
-		logke("no executable-memory path (set_memory_x/execmem_alloc missing)\n");
+	/* Without one of these there is no way to get executable memory, and
+	 * installing a hook into non-executable memory is a guaranteed fault on
+	 * the first branch into the trampoline. Refuse instead. */
+	if (!kp_hook_vmalloc_range &&
+	    !(kp_hook_module_alloc && kp_hook_set_memory_x)) {
+		logke("hook runtime: no executable-memory path; hooks disabled\n");
 		return -ENOSYS;
 	}
 
-	logki("hook runtime: probing allocator\n");
-	{
-		/* Allocate and free one page here, at init time, on purpose: if the
-		 * resolved allocator is not what its name claims, this is where it
-		 * shows up - inside a function whose only job is to fail cleanly -
-		 * instead of later inside a hook that cannot recover. */
-		void *probe = kp_hook_exec_alloc(PAGE_SIZE);
-
-		if (!probe) {
-			logke("hook runtime: allocator probe failed, hooks disabled\n");
-			return -ENOMEM;
-		}
-		logki("hook runtime: allocator probe ok at %px\n", probe);
-		kp_hook_exec_free(probe);
-		logki("hook runtime: allocator probe freed\n");
-	}
-
-	logki("KPM hook runtime ready (module_alloc=%px execmem_alloc=%px set_memory_x=%px)\n",
-	      kp_hook_module_alloc, kp_hook_execmem_alloc, kp_hook_set_memory_x);
+	logki("KPM hook runtime ready\n");
 	return 0;
 }
 
