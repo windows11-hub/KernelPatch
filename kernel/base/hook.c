@@ -800,7 +800,8 @@ hook_err_t hook_wrap(void *func, int32_t argno, void *before, void *after, void 
     if (err) goto err;
     err = hook_chain_add(chain, before, after, udata);
     if (err) goto err;
-    hook_chain_install(chain);
+    err = hook_chain_install(chain);
+    if (err) goto err;
     logkv("Wrap func: %llx succsseed\n", hook->func_addr);
     return HOOK_NO_ERR;
 err:
