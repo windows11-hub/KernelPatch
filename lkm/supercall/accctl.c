@@ -256,7 +256,15 @@ int kp_task_su(pid_t pid, uid_t to_uid, const char *sctx)
 	const struct cred *old;
 	struct cred *new;
 
-	task = find_get_task_by_vpid(pid);
+	/*
+	 * find_get_task_by_vpid() is not exported by this kernel (kernel/pid.c has
+	 * no EXPORT_SYMBOL for it). The equivalent with exported helpers is
+	 * find_vpid() + pid_task() + get_task_struct(), which is exactly what that
+	 * helper does internally.
+	 */
+	task = pid_task(find_vpid(pid), PIDTYPE_PID);
+	if (task)
+		get_task_struct(task);
 	if (!task) {
 		logke("task_su: no task pid %d\n", pid);
 		return -ESRCH;
