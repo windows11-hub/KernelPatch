@@ -3,31 +3,34 @@
 #   CONFIG_KP_LKM=m CC=clang make
 # or with the ddk CLI:
 #   ddk build android12-5.10 ODIR=... -e CONFIG_KP_LKM=m
+#
+# This tree is the "pure KernelPatch" shape:
+#   - inline hook engine + trampoline runtime   (hook/)
+#   - symbol resolution, text/memory patching   (infra/, minus syscall_table)
+#   - credential switching                      (supercall/accctl)
+#   - selinux_hook, linked in rather than loaded as a .kpm
+#
+# Removed on purpose:
+#   - kpm/            the KPM loader (sc_kpm_load and friends)
+#   - supercall/      the syscall-45 supercall channel, dispatch, su, kstorage
+#   - supercall/sucompat*  the execve redirect
+#   - infra/syscall_table.c  only sucompat and supercall used it
+# With those gone the module installs no syscall hook at all: every hook it
+# places is an inline hook through the engine in hook_engine.o.
 obj-$(CONFIG_KP_LKM) += kernelpatch.o
 
 kernelpatch-objs := \
 	core/init.o \
 	infra/symbol_resolver.o \
 	infra/patch_memory.o \
-	infra/syscall_table.o \
 	infra/sha256.o \
 	infra/secpass.o \
 	manager/apk_sign.o \
 	manager/manager.o \
-	supercall/supercall.o \
-	supercall/dispatch.o \
-	supercall/su.o \
-	supercall/kstorage.o \
-	supercall/sucompat.o \
-	supercall/sucompat_hook.o \
 	supercall/accctl.o \
+	selinux_hook/selinux_hook.o \
 	hook/hook_engine.o \
-	hook/hook_runtime.o \
-	kpm/module.o \
-	kpm/relo.o \
-	kpm/insn.o \
-	kpm/symbols.o \
-	kpm/kpm.o
+	hook/hook_runtime.o
 
 # Anchor include paths with $(src): for out-of-tree builds $(src) is the
 # module's absolute source dir, for in-tree it is KDIR-relative. We need two:
@@ -64,8 +67,7 @@ $(info -- KP version: $(KP_LKM_MAJOR).$(KP_LKM_MINOR).$(KP_LKM_PATCH) from $(KP_
 
 # Android build: picks the Android SU_PATH (/system/bin/kp) and SELinux
 # contexts (u:r:kp:s0 etc.) from user/uapi/scdefs.h. Without this the ko uses
-# the non-Android defaults (/usr/bin/kp, u:r:kernel:s0) and the AP manager
-# can't find the su binary.
+# the non-Android defaults (/usr/bin/kp, u:r:kernel:s0).
 ccflags-y += -DANDROID
 
 # Detect the arm64 dcache flush API. android13-5.10 backported
@@ -97,12 +99,19 @@ $(info -- KP kcfi: $(if $(filter 1,$(KP_HAVE_KCFI)),supported by compiler,unknow
 # calls into relocated hook bytes and module_alloc memory. That worked, but it
 # meant the whole driver ran without the mitigation the kernel was built with,
 # and every new object that reached a raw pointer was one forgotten flag away
-# from panicking again (that is how accctl.o broke).
+# from panicking again.
 #
 # The calls themselves are the problem, not the sanitizer: a C-level call
 # through an address with no KCFI type hash in front of it can never pass.
 # kp_call.h issues those branches in inline asm instead, so the compiler never
 # emits the check for them and everything else keeps its CFI.
+
+# selinux_hook patches the selinuxfs write_op pointer table through a manual
+# PTE walk plus TLBI, so keep the sequence intact and skip the stack protector
+# in the paths that run from policy-load context.
+CFLAGS_selinux_hook/selinux_hook.o += -fno-stack-protector
+CFLAGS_selinux_hook/selinux_hook.o += -Wno-unused-parameter -Wno-sign-compare
+CFLAGS_selinux_hook/selinux_hook.o += -Wno-missing-field-initializers
 
 # Legacy spelling only. Real kcfi is handled by kp_call.h, not by flags.
 CFLAGS_hook/hook_engine.o += -fno-sanitize=cfi
@@ -114,8 +123,7 @@ CFLAGS_hook/hook_engine.o += -std=gnu11 -Wno-strict-prototypes
 # LTO rejects merging objects with clashing sign-return-address module flags.
 CFLAGS_hook/hook_engine.o += -fno-lto
 # secpass calls kernel function pointers through backup variables; exempt from
-# CFI so the backup calls don't recurse into the CFI slowpath. Same flag-name
-# correction as above: kcfi is what the kernel actually instruments with.
+# CFI so the backup calls don't recurse into the CFI slowpath.
 CFLAGS_infra/secpass.o += -fno-sanitize=cfi
 # _transit4 runs from a kernel text function's inline hook; x18 there is NOT the
 # module's shadow-call-stack. Disable SCS so the transit never writes x30 through
