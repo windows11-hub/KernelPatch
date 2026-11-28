@@ -42,8 +42,7 @@ struct selinux_load_state;
  * symbol, declared below with the same prototype; its definition still comes
  * from kputils.c, which compiles in the KernelPatch world where those shims are
  * correct. */
-extern int __must_check compat_copy_to_user(void __user *to, const void *from, int n);
-extern long compat_strncpy_from_user(char *dest, const char __user *src, long count);
+
 
 /* kp_current_uid() returns kuid_t (a struct wrapper since 3.5). KernelPatch's
  * kputils.c wraps it into a plain uid_t, but that declaration lives in
@@ -53,22 +52,11 @@ static inline uid_t kp_current_uid(void)
     return __kuid_val(current_uid());
 }
 
-/* KernelPatch runtime symbols that <common.h> declares. That header cannot be
- * included here: it also declares the kpimg link-time markers (_kp_start,
- * _kp_text_start, _kp_hook_start, ...) which only exist inside the packed
- * kernel image, not in a loadable module. Only these two are used. */
-#define VERSION(major, minor, patch) (((major) << 16) + ((minor) << 8) + (patch))
-extern uint32_t kver;
-
-/* Same story for the task_struct field offsets: KernelPatch carries them as
- * runtime-resolved globals (task_struct_offset etc.), declared in kputils.h
- * which drags in the userland compiler shims. */
-/* Field offsets, defined in infra/kp_globals.c. An opaque placeholder is
- * enough here: only .tasks_offset and .comm_offset are read, and the size of
- * the object does not matter because access is by symbol, not by value. Keep
- * the type a struct tag so the extern matches the definition's linkage. */
-struct task_struct_offset;
-extern struct task_struct_offset task_struct_offset;
+/* kver, VERSION(), the task_struct offset table, the compat user-copy helpers
+ * and pgtable_entry all come from the shared header now. They used to be
+ * re-declared per file, which is how selinux_hook ended up with an
+ * unsigned long *pgtable_entry while kp_globals.c defined a uint64_t * one. */
+#include "../include/kp_globals.h"
 
 /* get_task_comm(tsk) here means "give me the comm string". The kernel spells it
  * get_task_comm(buf, tsk) from 5.10 on and __get_task_comm(buf, size, tsk)
@@ -138,7 +126,6 @@ static void *g_funcs[16];
 static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
-extern uint64_t *pgtable_entry(uint64_t pgd, uint64_t va);
 static sel_write_op_fn *g_write_op_access_slot;
 static sel_write_op_fn *g_write_op_context_slot;
 static sel_write_op_fn g_orig_write_op_access;
