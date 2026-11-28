@@ -28,6 +28,8 @@
 #include <linux/vmalloc.h>
 #include <linux/stddef.h>
 
+#include "../include/kp_globals.h"
+
 /* ---- kver -------------------------------------------------------------
  *
  * KernelPatch's own build number, distinct from LINUX_VERSION_CODE: it records
@@ -87,20 +89,6 @@ long compat_strncpy_from_user(char *dest, const char __user *src, long count)
  * Only tasks_offset and comm_offset are consumed today (selinux_hook walks the
  * task list looking for magiskinit); the rest are filled in for completeness.
  */
-struct task_struct_offset {
-    int pid_offset;
-    int tgid_offset;
-    int real_cred_offset;
-    int cred_offset;
-    int fs_offset;
-    int files_offset;
-    int comm_offset;
-    int stack_offset;
-    int tasks_offset;
-    int mm_offset;
-    int active_mm_offset;
-};
-
 struct task_struct_offset task_struct_offset = {
     .pid_offset       = (int)offsetof(struct task_struct, pid),
     .tgid_offset      = (int)offsetof(struct task_struct, tgid),
