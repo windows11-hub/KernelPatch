@@ -18,20 +18,24 @@
 #include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/fcntl.h>
 #include <uapi/linux/fs.h>
-/* <security.h> lives in the vendor tree (linux/security/selinux/include) that
- * the KPM build has on its include path; the LKM build does not. Only one type
- * from it is actually used - struct selinux_load_state, an opaque handle passed
- * by pointer to security_load_policy() - so declare it here instead of pulling
- * in a header we cannot reach.
- *
- * The struct is never dereferenced: selinux_hook only passes its address to the
- * kernel helper and reads nothing back. An incomplete type is therefore enough,
- * and it cannot drift from the kernel's layout because no field is touched. */
-struct selinux_load_state;
+#include <security.h>
 #include <ksyms.h>
 #include <hook.h>
-#include <kpmodule.h>
-#include <kputils.h>
+
+/* <kpmodule.h> and <kputils.h> are deliberately not included.
+ *
+ * Both live in kernel/patch/include and both pull KernelPatch's userland
+ * compiler shims (compiler.h defines __pure / __aligned / __printf / notrace /
+ * __weak / __used and a dozen more). Those names are already macros in
+ * linux/compiler.h, so the kernel build rejects the pair as redefinitions and
+ * stops at -ferror-limit.
+ *
+ * kpmodule.h only existed here for the KPM_* header macros, which are gone now
+ * that this file is a static component. kputils.h contributed exactly one
+ * symbol, declared below with the same prototype; its definition still comes
+ * from kputils.c, which compiles in the KernelPatch world where those shims are
+ * correct. */
+extern int __must_check compat_copy_to_user(void __user *to, const void *from, int n);
 
 /* Uplifted from KPM to a statically linked KernelPatch component.
  *
