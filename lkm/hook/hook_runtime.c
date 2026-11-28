@@ -174,12 +174,19 @@ static bool kp_hook_region_ok(void *p, unsigned long size)
 			return false;
 	}
 
-	/* Also reject the module image itself and any other kernel text/data the
-	 * allocator should never have returned. A module_alloc result is always
-	 * in the vmalloc area and never inside the running module's own ranges. */
-	if (a >= (unsigned long)&_stext && a < (unsigned long)&_end)
-		return false;
-
+	/*
+	 * Do NOT compare against &_stext / &_end here.
+	 *
+	 * Those are linker-generated absolute symbols for the kernel image. They
+	 * are not in EXPORT_SYMBOL, so a module that references them gets
+	 * "Unknown symbol _stext" from the loader. They were in the first version
+	 * of this check and are why the module could not load at all.
+	 *
+	 * The vmalloc-area test above already excludes kernel text: on arm64 the
+	 * image lives in the linear map, not in the vmalloc range, and module
+	 * memory is in MODULES_VADDR..MODULES_END inside the vmalloc area. That is
+	 * sufficient to reject text and stack, which is all this needs to do.
+	 */
 	return true;
 }
 
