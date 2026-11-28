@@ -483,12 +483,9 @@ struct av_decision {
  * that the services code ORs ioctl permission words into. An anonymous union
  * lets the services code reach it as xperms->drivers.p without the nested
  * struct spelling. */
-#define EXTENDED_PERMS_LEN 8
 struct extended_perms {
     u32 len;
-    struct extended_perms_data {
-        u32 p[EXTENDED_PERMS_LEN];
-    } drivers;
+    struct extended_perms_data drivers;
 };
 
 /* security/selinux/include/security.h: what security_load_policy() fills in.
