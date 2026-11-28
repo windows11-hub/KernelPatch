@@ -950,7 +950,29 @@ static bool clean_policydb_redirect_supported(void)
      * stateful SELinux helper signatures and the 6-argument policydb redirect
      * path.  Kernels older than this baseline stay on the pure legacy route.
      */
-    return !use_legacy_clean_blob_query() || g_selinux_state;
+    /*
+     * DISABLED.
+     *
+     * The clean-policy redirect is what drives context_struct_compute_av_intel:
+     * a hand-written walk over struct policydb that reads te_cond_avtab,
+     * class_val_to_struct, type_val_to_struct, process_trans_perms and a dozen
+     * more fields at offsets copied out of the source. On 6.6 that offsets
+     * table has not been runtime-verified, and a single wrong offset means
+     * dereferencing a field that is not a pointer - which on this kernel is an
+     * immediate fatal exception (CONFIG_PANIC_ON_OOPS=y, PANIC_TIMEOUT=-1),
+     * then a watchdog reset. There is no recoverable failure mode.
+     *
+     * Until those offsets are verified against the running kernel, keep the
+     * module to the part that does not walk policydb: the selinuxfs write_op
+     * filtering and the status-page redirection. Those answer the usual
+     * "does this device have a Magisk type" probes by rejecting the query, and
+     * they only touch data whose layout is verified (av_decision, the 20-byte
+     * status page, the write_op slot).
+     *
+     * Turning this back on is a one-line change once the policydb offsets have
+     * been confirmed on a live 6.6 kernel.
+     */
+    return false;
 }
 
 static bool current_is_policy_manager(void)
