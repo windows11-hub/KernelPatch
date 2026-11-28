@@ -614,13 +614,21 @@ hook_err_t hook_prepare(hook_t *hook)
 }
 KP_EXPORT_SYMBOL(hook_prepare);
 
-void hook_install(hook_t *hook)
+hook_err_t hook_install(hook_t *hook)
 {
     void *addrs[TRAMPOLINE_MAX_NUM];
     for (int32_t i = 0; i < hook->tramp_insts_num; ++i) {
         addrs[i] = (uint32_t *)hook->origin_addr + i;
     }
-    hotpatch(addrs, hook->tramp_insts, hook->tramp_insts_num);
+    /* The result used to be discarded: if hotpatch() could not write the
+     * trampoline (no executable memory, failed PTE walk), hook_wrap() still
+     * returned HOOK_NO_ERR and every later caller assumed the hook was live. */
+    int rc = hotpatch(addrs, hook->tramp_insts, hook->tramp_insts_num);
+    if (rc) {
+        logke("hook_install: hotpatch(%d insns) failed: %d\n", hook->tramp_insts_num, rc);
+        return (hook_err_t)rc;
+    }
+    return HOOK_NO_ERR;
 }
 KP_EXPORT_SYMBOL(hook_install);
 
