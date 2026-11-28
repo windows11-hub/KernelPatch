@@ -381,9 +381,13 @@ static inline void *fp_get_origin_func(void *hook_args)
     return (void *)chain->hook.origin_fp;
 }
 
-static inline void hook_chain_install(hook_chain_t *chain)
+/* Returns the patch result instead of dropping it. hook_install()'s hotpatch
+ * call can fail (no executable memory, PTE walk failure), and the old void
+ * signature made hook_wrap() report HOOK_NO_ERR for a hook that was never
+ * written into the kernel - the caller then believed the hook was live. */
+static inline hook_err_t hook_chain_install(hook_chain_t *chain)
 {
-    hook_install(&chain->hook);
+    return hook_install(&chain->hook);
 }
 
 static inline void hook_chain_uninstall(hook_chain_t *chain)
