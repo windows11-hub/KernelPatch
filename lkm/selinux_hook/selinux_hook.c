@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/sched/task.h>
+#include <linux/percpu.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
@@ -60,17 +61,26 @@ static inline uid_t kp_current_uid(void)
 
 /* get_task_comm(tsk) here means "give me the comm string". The kernel spells it
  * get_task_comm(buf, tsk) from 5.10 on and __get_task_comm(buf, size, tsk)
- * before that; both need a caller-supplied buffer, so wrap it once. */
+ * before that; both need a caller-supplied buffer, so wrap it once.
+ *
+ * The buffer must NOT be __thread. A TLS variable emits
+ * R_AARCH64_AUTH_ABS64 / R_AARCH64_AUTH_LD64_GOT_LO12_NC relocations (549 and
+ * 551), and the 6.6 module loader has no case for either: apply_relocate_add()
+ * returns -ENOEXEC and insmod reports "Exec format error". Per-CPU storage has
+ * no such problem, and every caller uses the result immediately as a printf
+ * argument, so one buffer per CPU is enough. */
+static DEFINE_PER_CPU(char[TASK_COMM_LEN], kp_comm_buf);
+
 static inline const char *kp_task_comm(const struct task_struct *tsk)
 {
-    static __thread char buf[TASK_COMM_LEN];
+    char *buf = this_cpu_ptr(kp_comm_buf);
 
     if (!tsk)
         return NULL;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
     get_task_comm(buf, (struct task_struct *)tsk);
 #else
-    __get_task_comm(buf, sizeof(buf), (struct task_struct *)tsk);
+    __get_task_comm(buf, TASK_COMM_LEN, (struct task_struct *)tsk);
 #endif
     buf[TASK_COMM_LEN - 1] = '\0';
     return buf;
