@@ -599,8 +599,7 @@ typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
 typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
 static raw_spin_lock_fn_t g_raw_spin_lock_fn;
 static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
-static unsigned long g_walk_addr;
-static bool g_walk_available;
+
 
 static raw_spinlock_t g_scopes_lock = { { 0 } };
 
@@ -1265,45 +1264,17 @@ static int cache_symbol_cb3(void *data, const char *name, unsigned long addr)
     return 0;
 }
 
-/* Signature of kallsyms_on_each_symbol per kernel generation:
- *   < 6.4        int f(cb(void*, const char*, unsigned long), void *data)
- *   >= 6.4       int f(cb(void*, const char*, struct module*, unsigned long),
- *                      void *data, struct module *mod)
- * Both the callback and the wrapper differ, so dispatch on kver and keep each
- * form in its own branch. g_walk_addr is the raw address taken by the asm in
- * the caller, so no declaration of the real prototype is involved.
- */
-typedef int (*kallsyms_walk_3_fn)(int (*fn)(void *, const char *, unsigned long), void *data);
-typedef int (*kallsyms_walk_4_fn)(int (*fn)(void *, const char *, struct module *, unsigned long),
-                                  void *data, struct module *mod);
-
-static int kallsyms_walk(void *unused_data)
-{
-    (void)unused_data;
-
-    if (!g_walk_addr)
-        return -ENOENT;
-
-    /* kver is the running kernel, which need not match the header the build
-     * used (vendor backports), so prefer the 4-argument form whenever the
-     * kernel reports 6.4 or newer and fall back to the 3-argument one. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    return ((kallsyms_walk_4_fn)g_walk_addr)(cache_symbol_cb4, NULL, NULL);
-#else
-    if (kver >= VERSION(6, 4, 0))
-        return ((kallsyms_walk_4_fn)g_walk_addr)(cache_symbol_cb4, NULL, NULL);
-    return ((kallsyms_walk_3_fn)g_walk_addr)(cache_symbol_cb3, NULL);
-#endif
-}
-
-static int cache_symbol_cb_nomod(void *data, const char *name, unsigned long addr)
-{
-    (void)data;
-
-    cache_symbol_match(name, addr);
-    return 0;
-}
-
+/* Symbol resolution uses kallsyms_lookup_name only.
+ *
+ * An earlier revision also walked the kallsyms table through
+ * kallsyms_on_each_symbol, taken by address with adrp/add to dodge the
+ * prototype mismatch. That does not work: the assembler still emits an
+ * undefined symbol for it, and this kernel does not export it, so insmod
+ * rejects the whole module with "Unknown symbol kallsyms_on_each_symbol".
+ *
+ * kallsyms_lookup_name is exported by the vendor kernel (the module links
+ * against it directly, so its presence is guaranteed), and every name below is
+ * a plain global the symbol table contains. One lookup per name is enough. */
 static void resolve_required_symbols_once(void)
 {
     size_t i;
@@ -1333,30 +1304,19 @@ static void resolve_required_symbols_once(void)
      * whatever prototype is needed at runtime is free of -Wincompatible-*
      * diagnostics. kallsyms_walk() then calls it with the argument count that
      * matches the running kernel. */
-    {
-        unsigned long walk_addr;
+    /* One lookup per name. g_symbol_cache[] already stores the exact name, and
+     * kallsyms_lookup_name returns 0 when a symbol is absent - which the loop
+     * below counts as "missing" rather than fatal. */
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        unsigned long addr;
 
-        asm volatile("adrp %0, kallsyms_on_each_symbol\n\t"
-                     "add  %0, %0, :lo12:kallsyms_on_each_symbol"
-                     : "=r"(walk_addr));
-        g_walk_addr = walk_addr;
-        g_walk_available = walk_addr != 0;
-    }
-
-    if (!READ_ONCE(g_walk_available)) {
-        pr_warn("[selinux_hook] kallsyms_on_each_symbol missing; falling back to exact symbol lookups only\n");
-        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
-            unsigned long addr;
-
-            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
-            if (addr) {
-                g_symbol_cache[i].addr = addr;
-                g_symbol_cache[i].exact = true;
-            }
+        addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+        if (addr) {
+            g_symbol_cache[i].addr = addr;
+            g_symbol_cache[i].exact = true;
         }
-    } else {
-        walk_rc = kallsyms_walk(NULL);
     }
+    walk_rc = 0;
 
     for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
         if (g_symbol_cache[i].addr) {
@@ -1367,7 +1327,7 @@ static void resolve_required_symbols_once(void)
     }
     walk_complete = walk_rc == 0 && found > 0;
 
-    if (found == 0 && READ_ONCE(g_walk_available)) {
+    if (found == 0) {
         pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
         for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
             unsigned long addr;
