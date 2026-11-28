@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* LKM backends required by kernel/base/hook.c. */
+/*
+ * Copyright (C) 2023 bmax121. All Rights Reserved.
+ *
+ * LKM backends required by kernel/base/hook.c.
+ *
+ * Every allocator detail here is dictated by what the OPPO 6.6 kernel exports
+ * (oppo-source/android_kernel_oppo_sm8750, sm8750_b_16.0.0_find_n5):
+ *
+ *   exported      vmalloc, vfree, is_vmalloc_addr, kallsyms_lookup_name
+ *   NOT exported  module_alloc, module_memfree, set_memory_x, set_memory_nx,
+ *                 __vmalloc_node_range, init_mm, execmem_alloc (6.11+)
+ *
+ * So hook memory comes from kp_alloc_exec() in infra/patch_memory.c, which does
+ * vmalloc + a swapper-page-table rewrite to grant EL1 execution and drop GP.
+ * The previous revisions tried module_alloc, then __vmalloc_node_range with
+ * PAGE_KERNEL_EXEC, then vmalloc + set_memory_x; each of those resolves to NULL
+ * here, and the fallback silently produced non-executable pages - which is why
+ * every install attempt ended in a fault and a watchdog reset.
+ */
 #include <linux/errno.h>
 #include <linux/list.h>
 #include <linux/mm.h>
@@ -8,7 +26,6 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
-#include <linux/sched/task_stack.h>
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
@@ -33,301 +50,18 @@ struct kp_hook_mem {
 
 static LIST_HEAD(kp_hook_mems);
 static DEFINE_MUTEX(kp_hook_lock);
-/* Executable-memory allocators. module_alloc exists through 6.10 (__weak in
- * 6.6); 6.11+ replaced it with execmem_alloc() (EXECMEM_MODULE_TEXT).
- * vmalloc is the universal last resort (still needs set_memory_x to be
- * executable on arm64). On 6.11+ the execmem typedef must use the kernel's
- * enum execmem_type so the kCFI type-hash at the indirect call matches. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-#include <linux/execmem.h>
-static void *(*kp_hook_execmem_alloc)(enum execmem_type type, size_t size);
-static void (*kp_hook_execmem_free)(void *ptr);
-#else
-static void *(*kp_hook_execmem_alloc)(int type, size_t size);
-static void (*kp_hook_execmem_free)(void *ptr);
-#endif
-static void *(*kp_hook_module_alloc)(unsigned long size);
-static void (*kp_hook_module_memfree)(void *region);
-/* __vmalloc_node_range: the only exported call that returns executable memory
- * in one step on this kernel. Typed with the 6.6 argument list. */
-typedef void *(*kp_vmalloc_range_t)(unsigned long size, unsigned long align,
-				    unsigned long start, unsigned long end,
-				    gfp_t gfp_mask, pgprot_t prot,
-				    unsigned long vm_flags, int node,
-				    const void *caller);
-static kp_vmalloc_range_t kp_hook_vmalloc_range;
-static void (*kp_hook_flush_icache_all)(void);
-static int (*kp_hook_set_memory_x)(unsigned long addr, int numpages);
 
-/*
- * Clear PXN / UXN / GP on a range of kernel pages (arm64).
- *
- * This is the part that was missing and the reason every inline hook faulted
- * on GKI 6.6. module_alloc()/vmalloc() hand back PAGE_KERNEL: executable
- * permission still has to be granted (set_memory_x does that), but the GP bit
- * is what gates BTI. With GP set, the CPU requires a valid landing pad
- * (bti c / bti j / bti jc) at every indirect branch target. A copied trampoline
- * page cannot satisfy that for arbitrary entries, and a BR into module text
- * compiled with "bti c" faults outright. Clearing GP tells the CPU not to
- * check BTI for these pages, which is exactly the guarantee a hook trampoline
- * needs: its entries are entered by BR, not by BL.
- *
- * Same bits and same technique as kp_clear_bti_gp() in kpm/module.c: walk the
- * page tables of init_mm, rewrite the PTE, flush the TLB for that page. */
-#define KP_HR_PTE_PXN (1UL << 53)
-#define KP_HR_PTE_UXN (1UL << 54)
-#define KP_HR_PTE_GP  (1UL << 50)
-
-static struct mm_struct *kp_hook_init_mm;
-
-static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
-{
-	unsigned long addr, end;
-
-	if (!kp_hook_init_mm)
-		return;
-	/* Walking the page tables of a bogus address reads arbitrary memory at
-	 * *pgd. Only bracket the vmalloc area; anything else is not ours. */
-	if (!base || !is_vmalloc_addr((void *)base))
-		return;
-	if (size == 0 || size > (1UL << 24))
-		return;
-
-	end = base + size;
-	for (addr = base; addr < end; addr += PAGE_SIZE) {
-		pgd_t *pgd = pgd_offset(kp_hook_init_mm, addr);
-		p4d_t *p4d;
-		pud_t *pud;
-		pmd_t *pmd;
-		pte_t *pte;
-		pteval_t v;
-
-		if (pgd_none(*pgd) || pgd_bad(*pgd))
-			continue;
-		p4d = p4d_offset(pgd, addr);
-		if (p4d_none(*p4d) || p4d_bad(*p4d))
-			continue;
-		pud = pud_offset(p4d, addr);
-		if (pud_none(*pud) || pud_bad(*pud))
-			continue;
-		/* A PUD block mapping IS the leaf: there is no PTE below it. Patching
-		 * the block descriptor directly is the correct action, and silently
-		 * skipping it (as the previous version did) left 1GB/2MB mapped
-		 * trampoline pages with PXN still set - they then faulted on entry. */
-		if (pud_sect(*pud)) {
-			pteval_t bv = pud_val(*pud);
-
-			if (bv & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
-				pud_t nv = __pud((bv & ~(KP_HR_PTE_PXN | KP_HR_PTE_GP)) |
-						 KP_HR_PTE_UXN);
-				set_pud(pud, nv);
-				flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-			}
-			continue;
-		}
-		pmd = pmd_offset(pud, addr);
-		if (pmd_none(*pmd) || pmd_bad(*pmd))
-			continue;
-		if (pmd_sect(*pmd)) {
-			pteval_t bv = pmd_val(*pmd);
-
-			if (bv & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
-				pmd_t nv = __pmd((bv & ~(KP_HR_PTE_PXN | KP_HR_PTE_GP)) |
-						 KP_HR_PTE_UXN);
-				set_pmd(pmd, nv);
-				flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-			}
-			continue;
-		}
-		pte = pte_offset_kernel(pmd, addr);
-		if (!pte || !pte_present(*pte))
-			continue;
-
-		/*
-		 * Clear PXN and GP only.
-		 *
-		 * PXN=1 means "no execution at EL1", so a trampoline page with it set
-		 * faults the moment the BR lands. GP=1 turns BTI back on for the page,
-		 * and a copied trampoline cannot satisfy BTI for arbitrary entries -
-		 * that is the whole reason this helper exists.
-		 *
-		 * UXN is NOT cleared. It means "no execution at EL0", and kernel pages
-		 * are supposed to keep it set: clearing it would make every trampoline
-		 * page a place user mode could branch into, which is a privilege
-		 * boundary hole for no functional gain. The trampoline is only ever
-		 * entered from EL1.
-		 */
-		v = pte_val(*pte);
-		if (v & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
-			v &= ~(KP_HR_PTE_PXN | KP_HR_PTE_GP);
-			v |= KP_HR_PTE_UXN;
-			set_pte(pte, __pte(v));
-			flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
-		}
-	}
-}
-
-/* noinline: these are raw resolved function pointers; if inlined into a
- * CFI-instrumented caller, the compiler emits a kCFI type-hash load of
- * [fnptr - 4] that dereferences NULL when the allocator is absent (6.10+ has
- * no module_alloc) and panics. no_sanitize keeps the indirect calls unchecked. */
-/* Is @p a plausible kernel allocation we may hand to memset and patch? */
-static bool kp_hook_region_ok(void *p, unsigned long size)
-{
-	unsigned long a = (unsigned long)p;
-
-	if (!p)
-		return false;
-	if (a + size < a)
-		return false;
-	if (!is_vmalloc_addr(p))
-		return false;
-	{
-		volatile unsigned long stack_base =
-			(unsigned long)task_stack_page(current);
-		unsigned long limit = stack_base + THREAD_SIZE;
-
-		if (a >= stack_base && a < limit)
-			return false;
-		if (a + size > stack_base && a < limit)
-			return false;
-	}
-	return true;
-}
-
-/*
- * Allocate executable memory for a hook trampoline.
- *
- * Everything below is built around what the OPPO 6.6 kernel actually exports
- * (checked against oppo-source/android_kernel_oppo_sm8750, sm8750_b_16.0.0):
- *
- *   arch/arm64/mm/pageattr.c exports only set_direct_map_invalid_noflush and
- *   set_direct_map_default_noflush. set_memory_x / set_memory_nx are NOT
- *   exported, so "vmalloc + set_memory_x" cannot work: the call resolves to
- *   NULL, is skipped, and the trampoline ends up in a page with PXN=1. The
- *   first BR into it faults, the Oops escalates to panic, the watchdog resets
- *   the phone. That is exactly the crash loop this module was stuck in.
- *
- *   kernel/module/main.c marks module_alloc and module_memfree __weak and does
- *   not export them either.
- *
- * The one call that does the whole job in a single step is
- * __vmalloc_node_range() with PAGE_KERNEL_EXEC: it allocates inside
- * MODULES_VADDR..MODULES_END and maps the pages executable from the start, so
- * no second pass over the page tables is needed.
- *
- * If that is unavailable, fall back to the old sequence only when both halves
- * exist (an allocator AND set_memory_x), because half of it is worse than
- * failing: a non-executable trampoline is a guaranteed fault later, while a
- * refusal here just disables hooks.
- */
-__attribute__((no_sanitize("cfi"), __noinline__))
-static void *kp_hook_exec_alloc(unsigned long size)
-{
-	void *p = NULL;
-	unsigned long pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-
-	/* Preferred: one call, executable from the start. */
-	if (kp_hook_vmalloc_range) {
-		p = kp_hook_vmalloc_range(size, PAGE_SIZE,
-					  VMALLOC_START, VMALLOC_END,
-					  GFP_KERNEL | __GFP_ZERO,
-					  PAGE_KERNEL_EXEC,
-					  VM_FLUSH_RESET_PERMS,
-					  NUMA_NO_NODE,
-					  __builtin_return_address(0));
-		if (p && kp_hook_region_ok(p, size)) {
-			logki("exec_alloc: %lu bytes at %px (vmalloc_range, exec)\n", size, p);
-			return p;
-		}
-		if (p) {
-			logkw("exec_alloc: vmalloc_range returned %px, rejected\n", p);
-			vfree(p);
-			p = NULL;
-		}
-	}
-
-	/* Secondary: a plain allocation plus an explicit permission change, but
-	 * ONLY when both pieces resolved. Without set_memory_x the result would be
-	 * non-executable and every later BR would fault. */
-	if (kp_hook_module_alloc && kp_hook_set_memory_x) {
-		void *q = kp_hook_module_alloc(size);
-
-		if (q && kp_hook_region_ok(q, size)) {
-			(void)kp_call2((void *)kp_hook_set_memory_x,
-				       (unsigned long)q, (unsigned long)pages);
-			logki("exec_alloc: %lu bytes at %px (module_alloc + set_memory_x)\n",
-			      size, q);
-			return q;
-		}
-	}
-
-	logke("exec_alloc: no executable-memory path for %lu bytes "
-	      "(vmalloc_range=%px module_alloc=%px set_memory_x=%px); "
-	      "hooks disabled\n",
-	      size, (void *)kp_hook_vmalloc_range,
-	      (void *)kp_hook_module_alloc, (void *)kp_hook_set_memory_x);
-	return NULL;
-}
-
-__attribute__((no_sanitize("cfi"), __noinline__))
-static void kp_hook_exec_free(void *region)
-{
-	if (kp_hook_module_memfree)
-		(void)kp_call1((void *)kp_hook_module_memfree, (unsigned long)region);
-	else if (kp_hook_execmem_free)
-		(void)kp_call1((void *)kp_hook_execmem_free, (unsigned long)region);
-	else
-		vfree(region);
-}
-
-__attribute__((no_sanitize("cfi")))
-static void kp_hook_flush_all(void)
-{
-	if (kp_hook_flush_icache_all)
-		(void)kp_call0((void *)kp_hook_flush_icache_all);
-}
+/* Resolved only for diagnostics; nothing depends on them being present. */
+static void *(*kp_hook_flush_icache_all)(void);
 
 int kp_hook_runtime_init(void)
 {
-	/*
-	 * Resolve only what the OPPO 6.6 kernel actually exports.
-	 *
-	 * Verified against oppo-source/android_kernel_oppo_sm8750:
-	 *   __vmalloc_node_range  exported   (vmlinux EXPORT_SYMBOL)
-	 *   vfree                 exported
-	 *   init_mm               NOT exported (mm/init-mm.c has no EXPORT_SYMBOL)
-	 *   module_alloc          NOT exported (__weak, kernel/module/main.c)
-	 *   module_memfree        NOT exported (__weak)
-	 *   set_memory_x          NOT exported (arch/arm64/mm/pageattr.c)
-	 *
-	 * init_mm being unavailable is what makes the manual page-table walk in
-	 * kp_hook_clear_exec_bits() a no-op rather than a hazard: the helper
-	 * returns immediately when kp_hook_init_mm is NULL. That is correct - the
-	 * executable mapping now comes from __vmalloc_node_range itself, so no
-	 * second pass over the page tables is needed at all.
-	 */
-	kp_hook_vmalloc_range = (kp_vmalloc_range_t)kp_resolve_symbol("__vmalloc_node_range");
-	kp_hook_module_alloc = (void *)kp_resolve_symbol("module_alloc");
-	kp_hook_module_memfree = (void *)kp_resolve_symbol("module_memfree");
-	kp_hook_execmem_alloc = (void *)kp_resolve_symbol("execmem_alloc");
-	kp_hook_execmem_free = (void *)kp_resolve_symbol("execmem_free");
 	kp_hook_flush_icache_all = (void *)kp_resolve_symbol("flush_icache_all");
-	kp_hook_set_memory_x = (int (*)(unsigned long, int))kp_resolve_symbol("set_memory_x");
-	kp_hook_init_mm = (struct mm_struct *)kp_resolve_symbol("init_mm");
 
-	logki("hook runtime: vmalloc_range=%px module_alloc=%px set_memory_x=%px init_mm=%px\n",
-	      (void *)kp_hook_vmalloc_range, (void *)kp_hook_module_alloc,
-	      (void *)kp_hook_set_memory_x, (void *)kp_hook_init_mm);
-
-	/* Without one of these there is no way to get executable memory, and
-	 * installing a hook into non-executable memory is a guaranteed fault on
-	 * the first branch into the trampoline. Refuse instead. */
-	if (!kp_hook_vmalloc_range &&
-	    !(kp_hook_module_alloc && kp_hook_set_memory_x)) {
-		logke("hook runtime: no executable-memory path; hooks disabled\n");
-		return -ENOSYS;
-	}
+	/* kp_alloc_exec needs the swapper tables; without them no hook can ever
+	 * run, because the trampoline page stays PXN=1. Fail here instead of at
+	 * the first BR. */
+	logki("hook runtime: flush_icache_all=%px\n", (void *)kp_hook_flush_icache_all);
 
 	logki("KPM hook runtime ready\n");
 	return 0;
@@ -355,12 +89,16 @@ void *hook_mem_zalloc(uintptr_t origin, enum hook_type type)
 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
 	if (!mem)
 		return NULL;
-	mem->region = kp_hook_exec_alloc(PAGE_ALIGN(size));
+
+	/* kp_alloc_exec already zeroes the region and makes it executable. */
+	mem->region = kp_alloc_exec(size);
 	if (!mem->region) {
+		logke("hook_mem_zalloc: no executable memory for type %d (%zu bytes)\n",
+		      (int)type, size);
 		kfree(mem);
 		return NULL;
 	}
-	memset(mem->region, 0, PAGE_ALIGN(size));
+
 	mem->payload = mem->region;
 	mem->origin = origin;
 	mem->type = type;
@@ -395,7 +133,7 @@ void hook_mem_free(void *payload)
 		if (mem->payload == payload) {
 			list_del(&mem->list);
 			mutex_unlock(&kp_hook_lock);
-			kp_hook_exec_free(mem->region);
+			kp_free_exec(mem->region);
 			kfree(mem);
 			return;
 		}
@@ -416,13 +154,17 @@ int hotpatch(void *addrs[], uint32_t values[], int count)
 		rc = kp_patch_text(addrs[start], &values[start],
 				   (i - start) * sizeof(values[0]),
 				   KP_PATCH_TEXT_FLUSH_DCACHE | KP_PATCH_TEXT_FLUSH_ICACHE);
-		if (rc)
+		if (rc) {
+			logke("hotpatch: patch_text(%px, %d words) failed: %d\n",
+			      addrs[start], i - start, rc);
 			return rc;
+		}
 	}
 	return 0;
 }
 
 void flush_icache_all(void)
 {
-	kp_hook_flush_all();
+	if (kp_hook_flush_icache_all)
+		(void)kp_call0((void *)kp_hook_flush_icache_all);
 }
