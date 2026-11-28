@@ -3488,8 +3488,8 @@ static int patch_kernel_ulong(void *addr, unsigned long value)
 {
     unsigned long saved[SELINUX_CONT_PTES];
     unsigned long *pgd;
-    unsigned long *pte;
-    unsigned long *base;
+    uint64_t *pte;
+    uint64_t *base;
     int count;
     int i;
 
@@ -3508,7 +3508,7 @@ static int patch_kernel_ulong(void *addr, unsigned long value)
         return -EFAULT;
 
     if (selinux_pte_valid_cont(READ_ONCE(*pte))) {
-        base = (unsigned long *)((unsigned long)pte & ~(sizeof(*pte) * SELINUX_CONT_PTES - 1));
+        base = (uint64_t *)((unsigned long)pte & ~(sizeof(*pte) * SELINUX_CONT_PTES - 1));
         count = SELINUX_CONT_PTES;
     } else {
         base = pte;
@@ -3521,7 +3521,7 @@ static int patch_kernel_ulong(void *addr, unsigned long value)
     }
     selinux_flush_tlb_kernel_page((unsigned long)addr);
 
-    WRITE_ONCE(*(unsigned long *)addr, value);
+    WRITE_ONCE(*(uint64_t *)addr, (uint64_t)value);
 
     for (i = 0; i < count; i++)
         WRITE_ONCE(base[i], saved[i]);
