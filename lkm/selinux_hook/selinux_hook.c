@@ -63,18 +63,12 @@ extern uint32_t kver;
 /* Same story for the task_struct field offsets: KernelPatch carries them as
  * runtime-resolved globals (task_struct_offset etc.), declared in kputils.h
  * which drags in the userland compiler shims. */
-/* KernelPatch keeps the resolved offsets in this struct (kputils.h). */
-struct kp_task_struct_offset {
-    int tasks_offset;      /* task_struct.tasks - list_head for the walk */
-    int comm_offset;
-    int cred_offset;
-    int real_cred_offset;
-    int fs_offset;
-    int files_offset;
-    int pid_offset;
-    int tgid_offset;
-};
-extern struct kp_task_struct_offset task_struct_offset;
+/* Field offsets, defined in infra/kp_globals.c. An opaque placeholder is
+ * enough here: only .tasks_offset and .comm_offset are read, and the size of
+ * the object does not matter because access is by symbol, not by value. Keep
+ * the type a struct tag so the extern matches the definition's linkage. */
+struct task_struct_offset;
+extern struct task_struct_offset task_struct_offset;
 
 /* get_task_comm(tsk) here means "give me the comm string". The kernel spells it
  * get_task_comm(buf, tsk) from 5.10 on and __get_task_comm(buf, size, tsk)
@@ -144,7 +138,7 @@ static void *g_funcs[16];
 static int g_hooks;
 struct file;
 typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
-extern unsigned long *pgtable_entry(unsigned long pgd, unsigned long va);
+extern uint64_t *pgtable_entry(uint64_t pgd, uint64_t va);
 static sel_write_op_fn *g_write_op_access_slot;
 static sel_write_op_fn *g_write_op_context_slot;
 static sel_write_op_fn g_orig_write_op_access;
