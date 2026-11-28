@@ -4,7 +4,7 @@
  *
  * Port of kernel/patch/common/secpass.c - CFI-bypass for the LKM.
  * Hooks report_cfi_failure / __cfi_slowpath_diag so that a CFI mismatch
- * on LKM text / hook trampoline / KPM memory degrades to a WARN instead
+ * on LKM text / hook trampoline memory degrades to a WARN instead
  * of panicking the kernel.
  */
 #include <linux/bug.h>
@@ -14,7 +14,6 @@
 #include <linux/types.h>
 
 #include "../include/kp_lkm.h"
-#include "../kpm/module.h"
 #include <hook.h>
 
 #include "../include/kp_call.h"
@@ -57,12 +56,10 @@ static bool kp_should_cfi_pass(unsigned long target)
 	if (kp_target_in_module(target))
 		return true;
 
-	/* Loaded / loading KPM images and the callback-trampoline page. KPM code
-	 * is no registered module, so Qualcomm's find_check_fn() and the KCFI
-	 * slowpath would otherwise reject it. */
-	if (kp_kpm_cfi_allowed_addr(target))
-		return true;
-
+	/* The KPM loader is gone, so there are no KPM images left to exempt. What
+	 * remains is this module's own text, covered by the check above, plus the
+	 * inline-hook trampolines, which live in module_alloc memory that the
+	 * runtime allocator already tracks. */
 	return false;
 }
 
@@ -144,7 +141,7 @@ int kp_bypass_kcfi(void)
 		if (rc)
 			logkw("hook find_check_fn error: %d\n", rc);
 	} else {
-		logkw("find_check_fn not found; KPM kallsyms CFI check unshielded\n");
+		logkw("find_check_fn not found; kallsyms CFI check unshielded\n");
 	}
 
 	addr = kallsyms_lookup_name("report_cfi_failure");
