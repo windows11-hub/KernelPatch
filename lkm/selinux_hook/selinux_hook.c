@@ -783,10 +783,10 @@ static int copy_status_to_user(void __user *dst, const void *src, size_t len)
     int copied;
 
     if (copy_to_user_nofault_fn)
-        return copy_to_user_nofault_fn(dst, src, len) ? -EFAULT : 0;
+        return kc_copy_to_user_nofault(dst, src, len) ? -EFAULT : 0;
 
     if (copy_to_user_raw_fn)
-        return copy_to_user_raw_fn(dst, src, len) ? -EFAULT : 0;
+        return kc_copy_to_user_raw(dst, src, len) ? -EFAULT : 0;
 
     copied = compat_copy_to_user(dst, src, (int)len);
     return copied == (int)len ? 0 : -EFAULT;
@@ -1479,10 +1479,10 @@ static int call_security_read_policy(void **data, size_t *len)
     if (selinux_state_arg_required()) {
         if (!g_selinux_state || !security_read_policy_compat_fn)
             return -ENOENT;
-        return security_read_policy_compat_fn(g_selinux_state, data, len);
+        return kc_read_policy_compat(g_selinux_state, data, len);
     }
     if (security_read_policy_fn)
-        return security_read_policy_fn(data, len);
+        return kc_read_policy(data, len);
     return -ENOENT;
 }
 
@@ -1497,7 +1497,7 @@ static int call_security_load_policy(void *data, size_t len, struct selinux_load
                                               load_state);
     }
     if (security_load_policy_fn)
-        return security_load_policy_fn(data, len, load_state);
+        return kc_load_policy(data, len, load_state);
     return -ENOENT;
 }
 
@@ -1506,11 +1506,11 @@ static void call_selinux_policy_cancel(struct selinux_load_state *load_state)
     if (selinux_state_arg_required()) {
         if (!g_selinux_state || !selinux_policy_cancel_compat_fn)
             return;
-        selinux_policy_cancel_compat_fn(g_selinux_state, load_state);
+        kc_policy_cancel_compat(g_selinux_state, load_state);
         return;
     }
     if (selinux_policy_cancel_fn)
-        selinux_policy_cancel_fn(load_state);
+        kc_policy_cancel(load_state);
 }
 
 static unsigned int ebitmap_start_positive_intel(struct ebitmap *e,
@@ -1665,9 +1665,9 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
 
     avkey.target_class = tclass;
     avkey.specified = AVTAB_AV | AVTAB_XPERMS;
-    sattr = (struct ebitmap *)flex_array_get_fn(policydb->type_attr_map_array,
+    sattr = (struct ebitmap *)kc_flex_array_get(policydb->type_attr_map_array,
                                                 scontext->type - 1);
-    tattr = (struct ebitmap *)flex_array_get_fn(policydb->type_attr_map_array,
+    tattr = (struct ebitmap *)kc_flex_array_get(policydb->type_attr_map_array,
                                                 tcontext->type - 1);
     if (!sattr || !tattr) {
         pr_warn("[selinux_hook] intel_av missing attr map s_type=%u t_type=%u sattr=%px tattr=%px policydb=%px\n",
@@ -1679,9 +1679,9 @@ static bool context_struct_compute_av_intel(struct policydb *policydb,
         ebitmap_for_each_positive_bit_intel(tattr, tnode, j) {
             avkey.source_type = i + 1;
             avkey.target_type = j + 1;
-            for (node = avtab_search_node_fn(&policydb->te_avtab, &avkey);
+            for (node = kc_avtab_search_node(&policydb->te_avtab, &avkey);
                  node;
-                 node = avtab_search_node_next_fn(node, avkey.specified)) {
+                 node = kc_avtab_search_node_next(node, avkey.specified)) {
                 if (node->key.specified == AVTAB_ALLOWED)
                     avd->allowed |= node->datum.u.data;
                 else if (node->key.specified == AVTAB_AUDITALLOW)
@@ -1734,7 +1734,7 @@ static void *read_load_state_policy(void *load_state)
         return NULL;
 
     if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(&policy, load_state, sizeof(policy)) == 0)
+        kc_nofault_read(&policy, load_state, sizeof(policy)) == 0)
         return policy;
 
     return *(void **)load_state;
@@ -1748,7 +1748,7 @@ static struct sidtab *read_policy_sidtab(void *policy)
         return NULL;
 
     if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(&sidtab, policy, sizeof(sidtab)) == 0)
+        kc_nofault_read(&sidtab, policy, sizeof(sidtab)) == 0)
         return sidtab;
 
     return *(struct sidtab **)policy;
@@ -1781,7 +1781,7 @@ static void cancel_clean_sidtab_convert(const char *reason)
         return;
     }
 
-    sidtab_cancel_convert_fn(sidtab);
+    kc_sidtab_cancel_convert(sidtab);
     selinux_hook_dbg("[selinux_hook] CLEAN canceled sidtab convert reason=%s clean_policy=%px sidtab=%px\n",
                      reason ?: "(null)", g_clean_load_state.policy, sidtab);
 }
@@ -1804,7 +1804,7 @@ static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count,
         return rc;
     }
 
-    return kernel_read_fn(file, buf, count, pos);
+    return kc_kernel_read(file, buf, count, pos);
 }
 
 /*
@@ -1902,35 +1902,35 @@ static void detect_apatch_manager_uid(void)
         return;
     }
 
-    filp = filp_open_fn(APATCH_PACKAGES_LIST_PATH, O_RDONLY, 0);
+    filp = kc_filp_open(APATCH_PACKAGES_LIST_PATH, O_RDONLY, 0);
     if (!filp || IS_ERR(filp)) {
         pr_warn("[selinux_hook] APatch manager uid open failed path=%s rc=%ld\n",
                 APATCH_PACKAGES_LIST_PATH, filp ? PTR_ERR(filp) : -ENOENT);
         return;
     }
 
-    len = vfs_llseek_fn(filp, 0, SEEK_END);
+    len = kc_vfs_llseek(filp, 0, SEEK_END);
     if (len <= 0 || len > APATCH_PACKAGES_LIST_MAX_SIZE) {
         pr_warn("[selinux_hook] APatch manager uid bad packages.list len=%lld\n", len);
-        filp_close_fn(filp, 0);
+        kc_filp_close(filp, 0);
         return;
     }
-    vfs_llseek_fn(filp, 0, SEEK_SET);
+    kc_vfs_llseek(filp, 0, SEEK_SET);
 
-    data = vmalloc_fn((unsigned long)len);
+    data = kc_vmalloc((unsigned long)len);
     if (!data) {
         pr_warn("[selinux_hook] APatch manager uid alloc failed len=%lld\n", len);
-        filp_close_fn(filp, 0);
+        kc_filp_close(filp, 0);
         return;
     }
 
     pos = 0;
     nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
-    filp_close_fn(filp, 0);
+    kc_filp_close(filp, 0);
     if (nread != len || pos != len) {
         pr_warn("[selinux_hook] APatch manager uid read failed read=%ld pos=%lld len=%lld\n",
                 (long)nread, pos, len);
-        vfree_fn(data);
+        kc_vfree(data);
         return;
     }
 
@@ -1943,7 +1943,7 @@ static void detect_apatch_manager_uid(void)
                 APATCH_MANAGER_PACKAGE);
     }
 
-    vfree_fn(data);
+    kc_vfree(data);
 }
 static bool magiskinit_process_exists(void)
 {
@@ -1982,7 +1982,7 @@ static bool try_snapshot_mock_policy(const char *reason)
         return false;
     }
 
-    filp = filp_open_fn(MAGISK_MOCK_POLICY_PATH, O_RDONLY, 0);
+    filp = kc_filp_open(MAGISK_MOCK_POLICY_PATH, O_RDONLY, 0);
     if (!filp || IS_ERR(filp)) {
         pr_warn("[selinux_hook] CLEAN mock policy open failed reason=%s path=%s rc=%ld\n",
                 reason ?: "(null)", MAGISK_MOCK_POLICY_PATH,
@@ -1990,31 +1990,31 @@ static bool try_snapshot_mock_policy(const char *reason)
         return false;
     }
 
-    len = vfs_llseek_fn(filp, 0, SEEK_END);
+    len = kc_vfs_llseek(filp, 0, SEEK_END);
     if (len <= 0 || len > MAGISK_MOCK_POLICY_MAX_SIZE) {
         pr_warn("[selinux_hook] CLEAN mock policy bad len reason=%s path=%s len=%lld\n",
                 reason ?: "(null)", MAGISK_MOCK_POLICY_PATH, len);
-        filp_close_fn(filp, 0);
+        kc_filp_close(filp, 0);
         return false;
     }
-    vfs_llseek_fn(filp, 0, SEEK_SET);
+    kc_vfs_llseek(filp, 0, SEEK_SET);
 
-    data = vmalloc_fn((unsigned long)len);
+    data = kc_vmalloc((unsigned long)len);
     if (!data) {
         pr_warn("[selinux_hook] CLEAN mock policy alloc failed reason=%s len=%lld\n",
                 reason ?: "(null)", len);
-        filp_close_fn(filp, 0);
+        kc_filp_close(filp, 0);
         return false;
     }
 
     pos = 0;
     nread = call_kernel_read_file(filp, data, (size_t)len, &pos);
-    filp_close_fn(filp, 0);
+    kc_filp_close(filp, 0);
     if (nread != len || pos != len) {
         pr_warn("[selinux_hook] CLEAN mock policy read failed reason=%s read=%ld pos=%lld len=%lld\n",
                 reason ?: "(null)", (long)nread, pos, len);
         if (vfree_fn)
-            vfree_fn(data);
+            kc_vfree(data);
         return false;
     }
 
@@ -2101,7 +2101,7 @@ static void try_load_clean_policydb_from_blob(const char *reason)
     if (!policydb_read_fn || !policydb_destroy_fn || !vmalloc_fn)
         return;
 
-    policydb = (struct policydb *)vmalloc_fn(CLEAN_POLICYDB_ALLOC_SIZE);
+    policydb = (struct policydb *)kc_vmalloc(CLEAN_POLICYDB_ALLOC_SIZE);
     if (!policydb) {
         pr_warn("[selinux_hook] CLEAN policydb_read alloc failed reason=%s size=%u\n",
                 reason ?: "(null)", CLEAN_POLICYDB_ALLOC_SIZE);
@@ -2111,14 +2111,14 @@ static void try_load_clean_policydb_from_blob(const char *reason)
 
     fp.data = (char *)blob;
     fp.len = len;
-    rc = policydb_read_fn(policydb, &fp);
+    rc = kc_policydb_read(policydb, &fp);
     if (rc) {
         pr_warn("[selinux_hook] CLEAN policydb_read failed reason=%s rc=%d policydb=%px blob=%px len=%zu\n",
                 reason ?: "(null)", rc, policydb, blob, len);
         if (policydb_destroy_fn)
-            policydb_destroy_fn(policydb);
+            kc_policydb_destroy(policydb);
         if (vfree_fn)
-            vfree_fn(policydb);
+            kc_vfree(policydb);
         return;
     }
 
@@ -2169,7 +2169,7 @@ static void snapshot_clean_policy(const char *reason)
                 reason ?: "(null)", rc, data, len);
         if (data)
             if (vfree_fn)
-                vfree_fn(data);
+                kc_vfree(data);
         return;
     }
 
@@ -2290,7 +2290,7 @@ static size_t copy_query_sample(char *dst, const char *src, size_t size)
     dst[0] = '\0';
 
     if (copy_from_kernel_nofault_fn &&
-        copy_from_kernel_nofault_fn(dst, src, limit) == 0) {
+        kc_nofault_read(dst, src, limit) == 0) {
         dst[limit] = '\0';
         return sanitize_query_sample(dst, limit);
     }
@@ -3954,7 +3954,7 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
     vm_start_off = (kver >= VERSION(6, 1, 0)) ? 16 : 0;
 
     if (!copy_from_kernel_nofault_fn ||
-        copy_from_kernel_nofault_fn(&vm_start, (char *)vma + vm_start_off,
+        kc_nofault_read(&vm_start, (char *)vma + vm_start_off,
                                     sizeof(vm_start)) != 0)
         return;
 
@@ -3967,10 +3967,10 @@ static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u)
         unsigned char patch_bytes[4];
         /* sequence at offset 4 */
         put_u32_le(patch_bytes, get_u32_le(g_clean_status_bytes + 4));
-        copy_to_user_nofault_fn((void __user *)(vm_start + 4), patch_bytes, 4);
+        kc_copy_to_user_nofault((void __user *)(vm_start + 4), patch_bytes, 4);
         /* policyload at offset 12 */
         put_u32_le(patch_bytes, get_u32_le(g_clean_status_bytes + 12));
-        copy_to_user_nofault_fn((void __user *)(vm_start + 12), patch_bytes, 4);
+        kc_copy_to_user_nofault((void __user *)(vm_start + 12), patch_bytes, 4);
     }
 
     n = READ_ONCE(g_status_read_count) + 1;
@@ -4031,7 +4031,7 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
     WRITE_ONCE(g_status_probe_count, probe);
     if (a->arg3) {
         if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_before, (void *)a->arg3,
+            kc_nofault_read(&pos_before, (void *)a->arg3,
                                         sizeof(pos_before)) != 0)
             pos_before = -2;
         else if (!copy_from_kernel_nofault_fn)
@@ -4051,7 +4051,7 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
                                     (loff_t *)a->arg3);
     if (a->arg3) {
         if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_after, (void *)a->arg3,
+            kc_nofault_read(&pos_after, (void *)a->arg3,
                                         sizeof(pos_after)) != 0)
             pos_after = -2;
         else if (!copy_from_kernel_nofault_fn)
@@ -4094,7 +4094,7 @@ static void after_sel_read_handle_status(hook_fargs4_t *a, void *u)
 
     if (a->arg3) {
         if (copy_from_kernel_nofault_fn &&
-            copy_from_kernel_nofault_fn(&pos_after, (void *)a->arg3,
+            kc_nofault_read(&pos_after, (void *)a->arg3,
                                         sizeof(pos_after)) != 0)
             pos_after = -2;
         else if (!copy_from_kernel_nofault_fn)
@@ -4200,7 +4200,7 @@ static void before_security_read_policy_common(hook_fargs4_t *a, void **out_data
         return;
     }
 
-    copy = vmalloc_fn(len);
+    copy = kc_vmalloc(len);
     if (!copy) {
         pr_warn("[selinux_hook] CLEAN policy read copy alloc failed len=%zu; fallback=live\n",
                 len);
@@ -4569,9 +4569,9 @@ long selinux_hook_exit(void *__user r)
 
     if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
         if (policydb_destroy_fn)
-            policydb_destroy_fn((struct policydb *)g_clean_policydb);
+            kc_policydb_destroy((struct policydb *)g_clean_policydb);
         if (vfree_fn)
-            vfree_fn(g_clean_policydb);
+            kc_vfree(g_clean_policydb);
         g_clean_policydb = NULL;
         g_clean_policydb_direct = false;
     }
@@ -4587,7 +4587,7 @@ long selinux_hook_exit(void *__user r)
 
     if (g_clean_policy_blob) {
         if (vfree_fn)
-            vfree_fn(g_clean_policy_blob);
+            kc_vfree(g_clean_policy_blob);
         g_clean_policy_blob = NULL;
         g_clean_policy_len = 0;
     }
