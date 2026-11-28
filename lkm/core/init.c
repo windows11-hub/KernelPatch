@@ -32,18 +32,19 @@
  * "it rebooted". A module parameter turns that single all-or-nothing load into
  * a sequence of steps that can be bisected from outside:
  *
- *   0  symbols + patch memory only            (no hook, no executable pages)
- *   1  + hook runtime init                    (allocators, init_mm, exec bits)
- *   2  + one trivial inline hook              (proves the hook engine works)
- *   3  + CFI bypass + manager scan
- *   4  + selinux_hook                         (full module)
+ *   0  patch memory only                     (one init_mm lookup)
+ *   1  + accctl symbol resolve
+ *   2  + hook runtime init                   (7 lookups, then an alloc probe)
+ *   3  + one trivial inline hook             (proves the hook engine works)
+ *   4  + CFI bypass + manager scan
+ *   5  + selinux_hook                        (full module)
  *
  * Load with: insmod kernelpatch.ko kp_stage=N
  * Each stage logs a marker before and after, so the last line in dmesg names
  * the step that died. */
-static int kp_stage = 4;
+static int kp_stage = 5;
 module_param(kp_stage, int, 0644);
-MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-4 (default 4, full module)");
+MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-5 (default 5, full module)");
 
 #include "../include/kp_lkm.h"
 #include "../infra/patch_memory.h"
@@ -175,36 +176,43 @@ int __init kernelpatch_init(void)
 		logke("stage 0 failed: patch memory %d\n", rc);
 		return rc;
 	}
-	logki("stage 0: accctl\n");
-	rc = kp_accctl_init();
-	if (rc) {
-		logke("stage 0 failed: accctl %d\n", rc);
-		return rc;
-	}
-	logki("stage 0 done\n");
+	logki("stage 0 done (patch memory only)\n");
 
 	if (kp_stage < 1) {
 		logki("KernelPatch LKM stopped at stage 0\n");
 		return 0;
 	}
 
-	logki("stage 1: hook runtime\n");
-	rc = kp_hook_runtime_init();
+	logki("stage 1: accctl symbol resolve\n");
+	rc = kp_accctl_init();
 	if (rc) {
-		logke("stage 1 failed: hook runtime %d\n", rc);
+		logke("stage 1 failed: accctl %d\n", rc);
 		return rc;
 	}
-	logki("stage 1 done\n");
+	logki("stage 1: accctl done\n");
+
+	if (kp_stage < 5) {
+		logki("KernelPatch LKM stopped at stage 4\n");
+		return 0;
+	}
+
+	logki("stage 2: hook runtime\n");
+	rc = kp_hook_runtime_init();
+	if (rc) {
+		logke("stage 2 failed: hook runtime %d\n", rc);
+		return rc;
+	}
+	logki("stage 4 done\n");
 
 	if (kp_stage < 2) {
 		logki("KernelPatch LKM stopped at stage 1\n");
 		return 0;
 	}
 
-	logki("stage 2: smoke hook\n");
+	logki("stage 3: smoke hook\n");
 	rc = kp_hook_smoke_test();
 	if (rc) {
-		logke("stage 2 failed: smoke hook %d\n", rc);
+		logke("stage 3 failed: smoke hook %d\n", rc);
 		return rc;
 	}
 	logki("stage 2 done\n");
@@ -214,12 +222,12 @@ int __init kernelpatch_init(void)
 		return 0;
 	}
 
-	logki("stage 3: CFI bypass\n");
+	logki("stage 4: CFI bypass\n");
 	rc = kp_bypass_kcfi();
 	if (rc)
-		logkw("stage 3: CFI bypass failed: %d (continuing)\n", rc);
+		logkw("stage 4: CFI bypass failed: %d (continuing)\n", rc);
 
-	logki("stage 3: manager scan\n");
+	logki("stage 4: manager scan\n");
 	kp_manager_init();
 	logki("stage 3 done\n");
 
@@ -228,10 +236,10 @@ int __init kernelpatch_init(void)
 		return 0;
 	}
 
-	logki("stage 4: selinux_hook\n");
+	logki("stage 5: selinux_hook\n");
 	rc = (int)selinux_hook_init(NULL, "lkm", NULL);
 	if (rc)
-		logkw("stage 4: selinux_hook init failed: %d\n", rc);
+		logkw("stage 5: selinux_hook init failed: %d\n", rc);
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
@@ -239,11 +247,11 @@ int __init kernelpatch_init(void)
 
 static void __exit kernelpatch_exit(void)
 {
-	if (kp_stage >= 4)
+	if (kp_stage >= 5)
 		selinux_hook_exit(NULL);
 	/* Unhook the CFI bypass last so it shields the teardown above from
 	 * spurious CFI failures on LKM text. */
-	if (kp_stage >= 3)
+	if (kp_stage >= 4)
 		kp_bypass_kcfi_exit();
 	logki("KernelPatch LKM unloaded\n");
 }
