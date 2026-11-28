@@ -184,125 +184,27 @@ int kp_commit_su(uid_t to_uid, const char *sctx)
 	return 0;
 }
 
-/* ---- SELinux enforcement bypass ---------------------------------------
+/* ---- SELinux enforcement bypass: REMOVED ---------------------------------
  *
- * Ported from kernel/patch/common/accctl.c bypass_selinux(). Same reason it
- * exists there: kp_commit_su() can set uid and capabilities, but an
- * untrusted_app domain that suddenly runs as uid 0 is still denied by SELinux
- * for the operations root needs (open /data/adb, mount, socket). The
- * translabel in kp_selinux_set_cred_context() covers the common case; this is
- * the second layer for ROMs where the magisk domain does not exist and the
- * translabel had to fall back to kernel creds.
+ * This block hooked avc_denied() and slow_avc_audit() to turn denials into
+ * grants for root-granted uids. It is gone for two independent reasons:
  *
- * Every argument is void* on purpose. avc_denied() and slow_avc_audit() take
- * struct av_decision / struct common_audit_data, which live in
- * security/selinux/avc.h - a kernel-private header an out-of-tree module
- * cannot include. KP carries its own copy of those headers because it builds
- * against a vendored tree; the LKM does not, so it passes the pointers through
- * untouched and only writes the two words it actually needs at the two offsets
- * the struct layout guarantees (allowed / auditallow / auditdeny are the first
- * three u32 of av_decision, in that order, on every supported kernel).
+ * 1. It collides with selinux_hook. That component answers the same queries
+ *    from the opposite direction - it returns the clean-policy result so a
+ *    caller probing for Magisk types gets EINVAL, exactly as it would on an
+ *    unmodified device. Forcing allow here would make compute_av and
+ *    avc_has_perm disagree, which is itself the view-inconsistency signal
+ *    Maple Detector looks for.
+ *
+ * 2. It was the only hook in this tree that ever tripped KCFI. The replacement
+ *    called hook()'s relocated original through a C function pointer;
+ *    kp_call8() in kp_call.h fixes that class of call, but the hook itself is
+ *    no longer needed, so the risk is removed rather than mitigated.
+ *
+ * kp_commit_su() below is unchanged: uid + capabilities still work, and the
+ * selinux_hook clean-policy redirect covers reading /data/adb.
  */
-struct kp_av_decision_head {
-	u32 allowed;
-	u32 auditallow;
-	u32 auditdeny;
-};
 
-typedef int (*kp_avc_denied_t)(void *ssid, void *tsid, void *tclass, void *requested,
-			       void *driver, void *xperm, void *flags, void *avd);
-typedef int (*kp_slow_avc_audit_t)(void *ssid, void *tsid, void *tclass, void *requested,
-				   void *audited, void *denied, void *result, void *a);
-
-static kp_avc_denied_t kp_avc_denied_orig;
-static kp_slow_avc_audit_t kp_slow_avc_audit_orig;
-static bool kp_selinux_bypass_on;
-
-/* Only the manager and the uids it granted root to get denials turned into
- * grants. Everything else keeps the stock decision. */
-static bool kp_selinux_bypass_current(void)
-{
-	uid_t uid;
-
-	if (!READ_ONCE(kp_selinux_bypass_on))
-		return false;
-	uid = from_kuid(current_user_ns(), current_uid());
-	return kp_is_su_allow_uid(uid) || kp_is_manager_uid(uid);
-}
-
-__attribute__((no_sanitize("cfi")))
-static int kp_avc_denied_hook(void *ssid, void *tsid, void *tclass, void *requested,
-			      void *driver, void *xperm, void *flags, void *avd)
-{
-	if (avd && kp_selinux_bypass_current()) {
-		struct kp_av_decision_head *d = (struct kp_av_decision_head *)avd;
-		d->allowed = 0xffffffffu;
-		d->auditallow = 0;
-		d->auditdeny = 0;
-		return 0;
-	}
-	if (!kp_avc_denied_orig)
-		return -EACCES;
-	/* Through kp_call8, not a C call: kp_avc_denied_orig is hook()'s
-	 * relocated original, i.e. instruction bytes with no KCFI type hash in
-	 * front of them. A C-level call would load the hash, fail, and panic
-	 * with "Oops - CFI" on the first stat() of the boot. See kp_call.h. */
-	return (int)kp_call8((void *)kp_avc_denied_orig,
-			     (unsigned long)ssid, (unsigned long)tsid,
-			     (unsigned long)tclass, (unsigned long)requested,
-			     (unsigned long)driver, (unsigned long)xperm,
-			     (unsigned long)flags, (unsigned long)avd);
-}
-
-__attribute__((no_sanitize("cfi")))
-static int kp_slow_avc_audit_hook(void *ssid, void *tsid, void *tclass, void *requested,
-				  void *audited, void *denied, void *result, void *a)
-{
-	/* Swallow the audit record for bypassed callers: a grant that still emits
-	 * an avc denial line is itself a detection signal. */
-	if (kp_selinux_bypass_current())
-		return 0;
-	if (!kp_slow_avc_audit_orig)
-		return (int)(long)result;
-	return (int)kp_call8((void *)kp_slow_avc_audit_orig,
-			     (unsigned long)ssid, (unsigned long)tsid,
-			     (unsigned long)tclass, (unsigned long)requested,
-			     (unsigned long)audited, (unsigned long)denied,
-			     (unsigned long)result, (unsigned long)a);
-}
-
-int kp_selinux_bypass_init(void)
-{
-	unsigned long addr;
-	hook_err_t rc;
-
-	addr = kp_resolve_symbol("avc_denied");
-	if (addr) {
-		rc = hook((void *)addr, (void *)kp_avc_denied_hook,
-			  (void **)&kp_avc_denied_orig);
-		if (rc == HOOK_NO_ERR)
-			logki("avc_denied hooked at %px (orig %px)\n",
-			      (void *)addr, (void *)kp_avc_denied_orig);
-		else
-			logkw("hook avc_denied(%px) failed: %d\n", (void *)addr, rc);
-	} else {
-		logkw("avc_denied not found; denial bypass unavailable\n");
-	}
-
-	addr = kp_resolve_symbol("slow_avc_audit");
-	if (addr) {
-		rc = hook((void *)addr, (void *)kp_slow_avc_audit_hook,
-			  (void **)&kp_slow_avc_audit_orig);
-		if (rc == HOOK_NO_ERR)
-			logki("slow_avc_audit hooked at %px (orig %px)\n",
-			      (void *)addr, (void *)kp_slow_avc_audit_orig);
-		else
-			logkw("hook slow_avc_audit(%px) failed: %d\n", (void *)addr, rc);
-	}
-
-	WRITE_ONCE(kp_selinux_bypass_on, true);
-	return 0;
-}
 
 int kp_task_su(pid_t pid, uid_t to_uid, const char *sctx)
 {
