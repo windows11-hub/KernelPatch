@@ -33,6 +33,9 @@ extern int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid)
 
 /* selinux_blob_sizes is a global; resolve via kallsyms. cred->security is a
  * pointer to the LSM cred blob; the selinux part lives at +lbs_cred. */
+/* struct lsm_blob_sizes from security/security.c. Field order is fixed by the
+ * kernel; the only one read here is lbs_cred, but the full shape is spelled out
+ * so a mismatch is visible on review rather than silent. */
 struct kp_lsm_blob_sizes {
 	int lbs_cred;
 	int lbs_file;
@@ -41,6 +44,7 @@ struct kp_lsm_blob_sizes {
 	int lbs_ipc;
 	int lbs_msg_msg;
 	int lbs_task;
+	int lbs_xattr_count;
 };
 
 static struct kp_lsm_blob_sizes *kp_selinux_blob_sizes;
@@ -54,12 +58,48 @@ struct kp_task_sec {
 
 int kp_accctl_init(void)
 {
-	kp_selinux_blob_sizes = (struct kp_lsm_blob_sizes *)kp_resolve_symbol("selinux_blob_sizes");
-	if (!kp_selinux_blob_sizes) {
+	void *addr;
+
+	/* Resolve, then VALIDATE before dereferencing.
+	 *
+	 * The old code only tested the pointer for NULL and then read ->lbs_cred.
+	 * If kallsyms returned something that is not selinux_blob_sizes - an alias,
+	 * an LTO-folded name, a different symbol - that read is a wild pointer
+	 * dereference inside insmod, which is exactly the kind of fault that takes
+	 * the kernel down before any log reaches the buffer.
+	 *
+	 * A plausible lsm_blob_sizes has small non-negative offsets and the cred
+	 * blob sits first, so lbs_cred is either 0 or a small positive number, and
+	 * every later field is larger than the one before it. Anything else means
+	 * the symbol resolved to the wrong object, and the translabel feature is
+	 * simply disabled instead of crashing the machine. */
+	addr = (void *)kp_resolve_symbol("selinux_blob_sizes");
+	kp_selinux_blob_sizes = NULL;
+
+	if (!addr) {
 		logke("failed to resolve selinux_blob_sizes; selinux translabel disabled\n");
 		return 0;
 	}
-	logki("selinux blob sizes: lbs_cred=%d\n", kp_selinux_blob_sizes->lbs_cred);
+	logki("selinux_blob_sizes at %px\n", addr);
+
+	if (!virt_addr_valid(addr)) {
+		logkw("selinux_blob_sizes=%px is not a valid kernel address; translabel disabled\n", addr);
+		return 0;
+	}
+
+	{
+		int cred = READ_ONCE(((struct kp_lsm_blob_sizes *)addr)->lbs_cred);
+
+		/* Offsets in struct lsm_blob_sizes are byte offsets into the LSM blob,
+		 * always within a few hundred bytes. A negative or huge value means we
+		 * are not looking at the real structure. */
+		if (cred < 0 || cred > 0x1000) {
+			logkw("selinux_blob_sizes.lbs_cred=%d out of range; translabel disabled\n", cred);
+			return 0;
+		}
+		kp_selinux_blob_sizes = (struct kp_lsm_blob_sizes *)addr;
+		logki("selinux blob sizes: lbs_cred=%d\n", cred);
+	}
 	return 0;
 }
 
