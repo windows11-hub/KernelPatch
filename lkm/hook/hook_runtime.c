@@ -119,21 +119,70 @@ static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
  * CFI-instrumented caller, the compiler emits a kCFI type-hash load of
  * [fnptr - 4] that dereferences NULL when the allocator is absent (6.10+ has
  * no module_alloc) and panics. no_sanitize keeps the indirect calls unchecked. */
+/* Is @p a plausible kernel allocation we may hand to memset and patch?
+ *
+ * This check exists because of a real crash: kp_resolve_symbol("module_alloc")
+ * resolved to something that was not module_alloc on a 6.6 GKI kernel, the call
+ * returned a stack address, and kp_hook_mem_zalloc() memset it - the DC ZVA in
+ * __memset ran off the 16K VMAP_STACK into the guard page and the Oops escalated
+ * to panic (panic_on_oops=1) and then to a hypervisor watchdog reset.
+ *
+ * Rejecting the value here turns "kernel dies with no usable trace" into "hook
+ * not installed, one warning in dmesg". */
+static bool kp_hook_region_ok(void *p, unsigned long size)
+{
+	unsigned long a = (unsigned long)p;
+
+	if (!p)
+		return false;
+	/* vmalloc/module area only. kmalloc'd memory must never land here, and a
+	 * stack or text address certainly must not. */
+	if (!is_vmalloc_addr(p))
+		return false;
+	if (a + size < a)		/* overflow */
+		return false;
+	return true;
+}
+
 __attribute__((no_sanitize("cfi"), __noinline__))
 static void *kp_hook_exec_alloc(unsigned long size)
 {
 	void *p = NULL;
 	unsigned long pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
-	if (kp_hook_module_alloc)
-		p = (void *)kp_call1((void *)kp_hook_module_alloc, (unsigned long)size);
-	else if (kp_hook_execmem_alloc)
-		p = (void *)kp_call2((void *)kp_hook_execmem_alloc, 0 /* EXECMEM_MODULE_TEXT */, (unsigned long)size);
-	else
+	/* Direct calls. The function is already no_sanitize("cfi") and the
+	 * pointers carry their real prototypes, so kp_callN() buys nothing here
+	 * and only obscures the return value. */
+	if (kp_hook_module_alloc) {
+		p = kp_hook_module_alloc(size);
+		if (!kp_hook_region_ok(p, size)) {
+			logkw("exec_alloc: module_alloc(%lu) returned %px, not a vmalloc region\n",
+			      size, p);
+			p = NULL;
+		}
+	}
+	if (!p && kp_hook_execmem_alloc) {
+		p = kp_hook_execmem_alloc(0 /* EXECMEM_MODULE_TEXT */, size);
+		if (!kp_hook_region_ok(p, size)) {
+			logkw("exec_alloc: execmem_alloc(%lu) returned %px, not a vmalloc region\n",
+			      size, p);
+			p = NULL;
+		}
+	}
+	if (!p) {
 		p = vmalloc(size);
+		if (!kp_hook_region_ok(p, size)) {
+			logkw("exec_alloc: vmalloc(%lu) returned %px\n", size, p);
+			p = NULL;
+		}
+	}
+	if (!p) {
+		logke("exec_alloc: no usable executable memory for %lu bytes\n", size);
+		return NULL;
+	}
 	/* GKI module_alloc returns PAGE_KERNEL (PXN set, NX); vmalloc too. Hook
 	 * trampolines live here and must be executable. */
-	if (p && kp_hook_set_memory_x)
+	if (kp_hook_set_memory_x)
 		(void)kp_call2((void *)kp_hook_set_memory_x, (unsigned long)p, (unsigned long)pages);
 	/*
 	 * set_memory_x only grants execution. The GP bit is still set, so the
@@ -141,8 +190,7 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	 * faults. Clear PXN/UXN/GP so the trampoline is enterable by BR, which
 	 * is how hook_chain_prepare() transfers control (LDR X16 + BR X16).
 	 */
-	if (p)
-		kp_hook_clear_exec_bits((unsigned long)p, pages << PAGE_SHIFT);
+	kp_hook_clear_exec_bits((unsigned long)p, pages << PAGE_SHIFT);
 	return p;
 }
 
