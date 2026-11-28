@@ -12,6 +12,16 @@
 #include "hmem.h"
 #include <kp_call.h>
 
+static inline void kp_zero_fargs(void *p, unsigned long n)
+{
+    volatile unsigned char *b = (volatile unsigned char *)p;
+
+    while (n--)
+        *b++ = 0;
+}
+
+
+
 #define bits32(n, high, low) ((uint32_t)((n) << (31u - (high))) >> (31u - (high) + (low)))
 #define bit(n, st) (((n) >> (st)) & 1)
 #define sign64_extend(n, len) \
@@ -376,7 +386,7 @@ uint64_t __attribute__((section(".transit0.text"))) __attribute__((__noinline__)
      * uses as a return value - for most SELinux helpers that value is a sid or
      * a pointer, so garbage there is a wild dereference.
      */
-    memset(&fargs, 0, sizeof(fargs));
+    kp_zero_fargs(&fargs, sizeof(fargs));
     fargs.skip_origin = 0;
     fargs.chain = hook_chain;
     for (int32_t i = 0; i < hook_chain->chain_items_max; i++) {
@@ -410,7 +420,7 @@ _transit4(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
     hook_chain_t *hook_chain = current_inline_hook_chain();
     if (!hook_chain) return 0;
     hook_fargs4_t fargs;
-    memset(&fargs, 0, sizeof(fargs));
+    kp_zero_fargs(&fargs, sizeof(fargs));
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
     fargs.arg1 = arg1;
@@ -448,7 +458,7 @@ _transit8(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t a
     hook_chain_t *hook_chain = current_inline_hook_chain();
     if (!hook_chain) return 0;
     hook_fargs8_t fargs;
-    memset(&fargs, 0, sizeof(fargs));
+    kp_zero_fargs(&fargs, sizeof(fargs));
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
     fargs.arg1 = arg1;
@@ -492,7 +502,7 @@ _transit12(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t 
     hook_chain_t *hook_chain = current_inline_hook_chain();
     if (!hook_chain) return 0;
     hook_fargs12_t fargs;
-    memset(&fargs, 0, sizeof(fargs));
+    kp_zero_fargs(&fargs, sizeof(fargs));
     fargs.skip_origin = 0;
     fargs.arg0 = arg0;
     fargs.arg1 = arg1;
