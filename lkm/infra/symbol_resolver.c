@@ -4,25 +4,30 @@
  *
  * Runtime symbol resolver for the LKM.
  *
- * The old implementation was a one-liner over kallsyms_lookup_name(). That is
- * wrong on this platform: the symbol is linked (so the call compiles and the
- * module loads), but on this vendor kernel it returns 0 for every name. The
- * result was silent: module_alloc, set_memory_x, init_mm and selinux_blob_sizes
- * all came back NULL, every feature disabled itself, and nothing said why.
+ * Facts established from the 6.6 source, which this file is built around:
  *
- * kallsyms_on_each_symbol() is also exported here and does work, so use it as
- * the primary path: walk the table once, cache the names we care about, and
- * fall back to kallsyms_lookup_name only if the walk is unavailable.
+ *   kernel/kallsyms.c in v6.6 exports exactly three symbols, all _GPL:
+ *   sprint_symbol, sprint_symbol_build_id, sprint_symbol_no_offset.
+ *   kallsyms_lookup_name and kallsyms_on_each_symbol are NOT exported
+ *   anywhere in mainline 6.6.
  *
- * The signature of kallsyms_on_each_symbol changed at 6.4 in both the callback
- * and the call:
+ *   arch/arm64/mm/pageattr.c exports nothing at all, so set_memory_nx / _x
+ *   are not reachable by name either.
  *
- *   < 6.4   int f(int (*cb)(void *, const char *, unsigned long), void *data)
- *   >= 6.4  int f(int (*cb)(void *, const char *, struct module *,
- *                           unsigned long), void *data, struct module *mod)
+ *   kernel/module/main.c marks module_alloc and module_memfree __weak and
+ *   does not export them.
  *
- * and some vendor 5.10/5.15 trees backported the module argument, so the shape
- * is chosen at runtime from kver rather than at compile time.
+ * A module that names any of those would be rejected by the loader with
+ * "Unknown symbol". This module loads, so the device's vendor kernel exports
+ * some of them - which ones is exactly what the log line in kp_symres_init()
+ * reports.
+ *
+ * Therefore: reach kallsyms_lookup_name by its linked symbol only (the kernel
+ * build guarantees it resolves or the module would not load at all), and treat
+ * kallsyms_on_each_symbol as optional. Referencing the latter through the
+ * assembler keeps the object free of a hard dependency on it: if the vendor
+ * kernel does not export it, adrp still produces a number and kp_each_addr
+ * simply fails the "is it inside the kernel image" check below.
  */
 #include "symbol_resolver.h"
 
@@ -34,7 +39,6 @@
 
 #include "../include/kp_lkm.h"
 
-/* kver and VERSION() live in infra/kp_globals.c. */
 extern uint32_t kver;
 #ifndef VERSION
 #define VERSION(major, minor, patch) (((major) << 16) + ((minor) << 8) + (patch))
@@ -51,7 +55,7 @@ static struct kp_sym_entry kp_sym_cache[KP_SYM_CACHE_MAX];
 static int kp_sym_cache_count;
 static bool kp_sym_cache_ready;
 
-/* The walk function, taken by name so no prototype has to match. */
+/* kallsyms_on_each_symbol, taken without a prototype. */
 static unsigned long kp_each_addr;
 
 /* ---- table walk ------------------------------------------------------- */
@@ -69,7 +73,7 @@ static int kp_walk_match(void *data, const char *name, unsigned long addr)
 		return 0;
 	if (!strcmp(name, ctx->want)) {
 		ctx->addr = addr;
-		return 1;	/* stop at the exact match */
+		return 1;
 	}
 	return 0;
 }
@@ -90,8 +94,6 @@ static int kp_walk_cb4(void *data, const char *name, struct module *m, unsigned 
 	return kp_walk_match(data, name, addr);
 }
 
-/* One walk, one symbol. The cache below turns repeated lookups into a linear
- * scan of a small array instead of another pass over kallsyms. */
 static unsigned long kp_walk_lookup(const char *name)
 {
 	struct kp_walk_ctx ctx = { .want = name, .addr = 0 };
@@ -99,6 +101,10 @@ static unsigned long kp_walk_lookup(const char *name)
 	if (!kp_each_addr)
 		return 0;
 
+	/* The call shape follows the RUNNING kernel. Vendor 5.10/5.15 trees may
+	 * carry the three-argument backport, 6.4+ always has four. Passing the
+	 * wrong count leaves x2 holding whatever the compiler left there, which
+	 * the kernel then dereferences as struct module *. */
 	if (kver >= VERSION(6, 4, 0))
 		(void)((kp_each_4_t)kp_each_addr)(kp_walk_cb4, &ctx, NULL);
 	else
@@ -117,7 +123,6 @@ unsigned long kp_resolve_symbol(const char *name)
 	if (!name)
 		return 0;
 
-	/* Cache first: hook init asks for the same handful of names repeatedly. */
 	if (kp_sym_cache_ready) {
 		for (i = 0; i < kp_sym_cache_count; i++) {
 			if (!strcmp(kp_sym_cache[i].name, name))
@@ -125,15 +130,16 @@ unsigned long kp_resolve_symbol(const char *name)
 		}
 	}
 
-	/* Primary: walk the kallsyms table. This is the path that actually works
-	 * on this kernel. */
-	addr = kp_walk_lookup(name);
+	/* kallsyms_lookup_name is linked (its declaration is in
+	 * <linux/kallsyms.h> and the module would not load if the kernel did not
+	 * provide it), so call it directly. This is the reliable path. */
+	addr = kallsyms_lookup_name(name);
 
-	/* Fallback only. On this platform it returns 0 for everything, so it is
-	 * kept purely so a kernel where the walk is unavailable still has a
-	 * chance, and the log below makes the outcome explicit either way. */
+	/* Walk the table only if the direct lookup came up empty and the walk is
+	 * available. Never call the walk first: on a kernel that does not export
+	 * kallsyms_on_each_symbol the pointer is garbage and calling it faults. */
 	if (!addr)
-		addr = kallsyms_lookup_name(name);
+		addr = kp_walk_lookup(name);
 
 	if (kp_sym_cache_ready && kp_sym_cache_count < KP_SYM_CACHE_MAX) {
 		kp_sym_cache[kp_sym_cache_count].name = name;
@@ -148,45 +154,50 @@ void *kp_resolve_symbol_variant(const char *name)
 {
 	char cfi_name[KSYM_NAME_LEN];
 	unsigned long jt;
-	unsigned long exact;
 	int n;
 
 	if (!name)
 		return NULL;
 
-	/* Traditional CFI (< 6.1) requires calling functions through their .cfi_jt
-	 * canonical-jump-table entry, not the function body - a direct indirect
-	 * call to the body trips __cfi_check (panic). */
 	n = snprintf(cfi_name, sizeof(cfi_name), "%s.cfi_jt", name);
 	if (n > 0 && n < (int)sizeof(cfi_name)) {
-		jt = kp_walk_lookup(cfi_name);
-		if (!jt)
-			jt = kallsyms_lookup_name(cfi_name);
+		jt = kp_resolve_symbol(cfi_name);
 		if (jt)
 			return (void *)jt;
 	}
 
-	exact = kp_resolve_symbol(name);
-	return (void *)exact;
+	return (void *)kp_resolve_symbol(name);
 }
 
 void kp_symres_init(void)
 {
+	unsigned long lookup;
+
 	kp_sym_cache_count = 0;
 	kp_sym_cache_ready = true;
 
-	/* Take the walk function's address by name through the assembler: the
-	 * symbol is linked, so &fn is a compile-time constant and a NULL test on
-	 * it is always false (the kernel build rejects that under -Werror), and
-	 * its prototype differs per kernel so no single cast fits. adrp/add gives
-	 * a plain integer with no function type involved. */
+	/* Report the one address that decides whether any of this can work. */
+	lookup = (unsigned long)kallsyms_lookup_name;
+	logki("symbol resolver: kallsyms_lookup_name=%px\n", (void *)lookup);
+	if (!lookup)
+		logke("symbol resolver: kallsyms_lookup_name is NULL, no symbol can be resolved\n");
+
+	/* Optional. adrp/add yields a plain integer, so referencing a symbol the
+	 * kernel may not export does not create a link dependency. */
+	kp_each_addr = 0;
 	asm volatile("adrp %0, kallsyms_on_each_symbol\n\t"
 		     "add  %0, %0, :lo12:kallsyms_on_each_symbol"
 		     : "=r"(kp_each_addr));
 
-	logki("symbol resolver: on_each_symbol=%px lookup_name=%px\n",
-	      (void *)kp_each_addr, (void *)kallsyms_lookup_name);
+	/* If the symbol does not exist the linker still placed something there;
+	 * reject anything that is not a plausible kernel text address. */
+	if (kp_each_addr < 0xffffff8000000000UL) {
+		logki("symbol resolver: kallsyms_on_each_symbol not usable (%px), walk disabled\n",
+		      (void *)kp_each_addr);
+		kp_each_addr = 0;
+	} else {
+		logki("symbol resolver: kallsyms_on_each_symbol=%px\n", (void *)kp_each_addr);
+	}
 
-	if (!kp_each_addr)
-		logkw("symbol resolver: table walk unavailable, falling back to kallsyms_lookup_name only\n");
+	logki("symbol resolver: ready (kver=%x)\n", kver);
 }
