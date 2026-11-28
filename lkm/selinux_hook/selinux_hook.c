@@ -343,15 +343,6 @@ struct avtab_key {
 #define AVTAB_XPERMS_IOCTLFUNCTION 0x01
 #define AVTAB_XPERMS_IOCTLDRIVER 0x02
 
-/* SELinux stores ioctl permission bits in a fixed 8-x-32 bitmap. The kernel
- * header declares it in security/selinux/ss/avtab.h, which the LKM build cannot
- * reach, so mirror it here. The size matters: avtab_extended_perms embeds it by
- * value and the kernel reads those bytes. */
-#define EXTENDED_PERMS_LEN 8
-struct extended_perms_data {
-    u32 p[EXTENDED_PERMS_LEN];
-};
-
 struct avtab_extended_perms {
     u8 specified;
     u8 driver;
