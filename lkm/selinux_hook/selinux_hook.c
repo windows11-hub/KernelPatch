@@ -57,6 +57,7 @@ static inline uid_t kp_current_uid(void)
  * re-declared per file, which is how selinux_hook ended up with an
  * unsigned long *pgtable_entry while kp_globals.c defined a uint64_t * one. */
 #include "../include/kp_globals.h"
+#include "../infra/patch_memory.h"
 
 /* get_task_comm(tsk) here means "give me the comm string". The kernel spells it
  * get_task_comm(buf, tsk) from 5.10 on and __get_task_comm(buf, size, tsk)
@@ -3467,78 +3468,26 @@ static unsigned long selinux_tlbi_vaddr(unsigned long addr)
     return v;
 }
 
-static void selinux_flush_tlb_kernel_page(unsigned long addr)
-{
-    addr = selinux_tlbi_vaddr(addr);
-    asm volatile("dsb ishst\n"
-                 "tlbi vaale1is, %0\n"
-                 "dsb ish\n"
-                 "isb\n"
-                 :
-                 : "r"(addr)
-                 : "memory");
-}
-
-static bool selinux_pte_valid_cont(unsigned long pte)
-{
-    return (pte & (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT)) ==
-           (SELINUX_PTE_VALID | SELINUX_PTE_TABLE_BIT | SELINUX_PTE_CONT);
-}
-
-static void *lookup_kernel_pgd(void)
-{
-    void *pgd;
-
-    pgd = lookup_name_optional_suffix("swapper_pg_dir");
-    if (!pgd)
-        pgd = lookup_name_optional_suffix("init_pg_dir");
-    return pgd;
-}
-
 static int patch_kernel_ulong(void *addr, unsigned long value)
 {
-    unsigned long saved[SELINUX_CONT_PTES];
-    unsigned long *pgd;
-    uint64_t *pte;
-    uint64_t *base;
-    int count;
-    int i;
-
-    if (!addr)
-        return -EINVAL;
-
-    pgd = (unsigned long *)lookup_kernel_pgd();
-    if (!pgd)
-        return -ENOENT;
-
-    pte = pgtable_entry((unsigned long)pgd, (unsigned long)addr);
-    if (!pte)
-        return -EFAULT;
-
-    if (!READ_ONCE(*pte))
-        return -EFAULT;
-
-    if (selinux_pte_valid_cont(READ_ONCE(*pte))) {
-        base = (uint64_t *)((unsigned long)pte & ~(sizeof(*pte) * SELINUX_CONT_PTES - 1));
-        count = SELINUX_CONT_PTES;
-    } else {
-        base = pte;
-        count = 1;
-    }
-
-    for (i = 0; i < count; i++) {
-        saved[i] = READ_ONCE(base[i]);
-        WRITE_ONCE(base[i], (saved[i] | SELINUX_PTE_DBM) & ~SELINUX_PTE_RDONLY);
-    }
-    selinux_flush_tlb_kernel_page((unsigned long)addr);
-
-    WRITE_ONCE(*(uint64_t *)addr, (uint64_t)value);
-
-    for (i = 0; i < count; i++)
-        WRITE_ONCE(base[i], saved[i]);
-    selinux_flush_tlb_kernel_page((unsigned long)addr);
-
-    return 0;
+    /* Write a pointer-sized field in kernel memory that the kernel mapped
+     * read-only (the selinuxfs write_op table lives in .rodata).
+     *
+     * This used to walk the page tables by hand: look up swapper_pg_dir, find
+     * the leaf PTE, flip PTE_DBM / clear PTE_RDONLY, flush, write, restore.
+     * That path panics on this tree. The walk has three unstated assumptions
+     * (4K pages, page_shift/page_level matching the image, the target being
+     * reachable through the direct map) and any mismatch writes through a
+     * bogus descriptor - which takes the kernel down before it can log
+     * anything, so the watchdog is the only thing that reports it.
+     *
+     * kp_patch_text() in infra/patch_memory.c already solves this the way the
+     * kernel does: resolve the physical address through init_mm, map it at
+     * FIX_TEXT_POKE0, copy through copy_to_kernel_nofault(), unmap, flush. It is
+     * the path the sys_call_table patching in this same module uses, so it is
+     * known good on this kernel. Use it instead of a second implementation.
+     */
+    return kp_patch_text(addr, &value, sizeof(value), 0);
 }
 
 static int hotpatch_write_op_slot(sel_write_op_fn *slot, sel_write_op_fn value,
