@@ -544,6 +544,154 @@ static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, lof
 static loff_t (*vfs_llseek_fn)(struct file *file, loff_t offset, int whence);
 static void *g_selinux_state;
 
+/* ── KCFI-safe calls to every kernel address ──────────────────────────
+ *
+ * All of the pointers above came from kallsyms_lookup_name(): bare addresses
+ * with no KCFI type hash in front of them. Calling one through the pointer
+ * makes clang emit, right at the call site,
+ *
+ *     add  x8, x8, #-4          ; or ldr w8, [x8, #-4]
+ *     ldr  w8, [x8]             ; load the callee hash
+ *     cmp  w8, #<our prototype hash>
+ *     b.eq ok
+ *     brk  #0x8228              ; KCFI failure
+ *
+ * The kernel function has no hash - policydb_read starts with an ordinary
+ * prologue - so the loaded word is an instruction encoding, the compare fails
+ * and the CPU traps. This is what the device log shows:
+ *
+ *   CFI failure at try_load_clean_policydb_from_blob+0x110/0x1e0
+ *     (target: policydb_read+0x0/0x9c; expected type: 0x6476e783)
+ *   Internal error: Oops - CFI: BRK #0x8228
+ *   Code: 729cf071 d7ac8ed1 4b11021f 54000040 (d4304500)
+ *
+ * The (d4304500) is BRK #0x8228 sitting where the call used to be.
+ *
+ * kp_callN() issues the branch in inline asm. The compiler cannot instrument
+ * an instruction it did not generate, so the call becomes an ordinary indirect
+ * branch with no check and no trap. <kp_call.h> documents exactly this; it was
+ * simply never applied to these twenty-one pointers.
+ *
+ * The wrappers below preserve the original argument shapes, so the call sites
+ * read as before and only the callee changes.
+ */
+static inline int kc_nofault_read(void *dst, const void *src, size_t n)
+{
+    return (int)kp_call3((void *)copy_from_kernel_nofault_fn,
+                         (unsigned long)dst, (unsigned long)src, (unsigned long)n);
+}
+
+static inline int kc_copy_to_user_nofault(void *dst, const void *src, size_t n)
+{
+    return (int)kp_call3((void *)copy_to_user_nofault_fn,
+                         (unsigned long)dst, (unsigned long)src, (unsigned long)n);
+}
+
+static inline int kc_copy_to_user_raw(void *dst, const void *src, size_t n)
+{
+    return (int)kp_call3((void *)copy_to_user_raw_fn,
+                         (unsigned long)dst, (unsigned long)src, (unsigned long)n);
+}
+
+static inline int kc_read_policy(void **data, size_t *len)
+{
+    return (int)kp_call2((void *)security_read_policy_fn,
+                         (unsigned long)data, (unsigned long)len);
+}
+
+static inline int kc_read_policy_compat(void *state, void **data, size_t *len)
+{
+    return (int)kp_call3((void *)security_read_policy_compat_fn,
+                         (unsigned long)state, (unsigned long)data, (unsigned long)len);
+}
+
+static inline int kc_load_policy(void *data, size_t len, void *load_state)
+{
+    return (int)kp_call3((void *)security_load_policy_fn,
+                         (unsigned long)data, (unsigned long)len,
+                         (unsigned long)load_state);
+}
+
+static inline int kc_policydb_read(void *policydb, void *fp)
+{
+    return (int)kp_call2((void *)policydb_read_fn,
+                         (unsigned long)policydb, (unsigned long)fp);
+}
+
+static inline void kc_policydb_destroy(void *policydb)
+{
+    (void)kp_call1((void *)policydb_destroy_fn, (unsigned long)policydb);
+}
+
+static inline void *kc_flex_array_get(void *fa, unsigned int idx)
+{
+    return (void *)kp_call2((void *)flex_array_get_fn,
+                            (unsigned long)fa, (unsigned long)idx);
+}
+
+static inline void *kc_avtab_search_node(void *tab, void *key)
+{
+    return (void *)kp_call2((void *)avtab_search_node_fn,
+                            (unsigned long)tab, (unsigned long)key);
+}
+
+static inline void *kc_avtab_search_node_next(void *node, int spec)
+{
+    return (void *)kp_call2((void *)avtab_search_node_next_fn,
+                            (unsigned long)node, (unsigned long)spec);
+}
+
+static inline void kc_policy_cancel(void *load_state)
+{
+    (void)kp_call1((void *)selinux_policy_cancel_fn, (unsigned long)load_state);
+}
+
+static inline void kc_policy_cancel_compat(void *state, void *load_state)
+{
+    (void)kp_call2((void *)selinux_policy_cancel_compat_fn,
+                   (unsigned long)state, (unsigned long)load_state);
+}
+
+static inline void kc_sidtab_cancel_convert(void *sidtab)
+{
+    (void)kp_call1((void *)sidtab_cancel_convert_fn, (unsigned long)sidtab);
+}
+
+static inline void *kc_vmalloc(unsigned long len)
+{
+    return (void *)kp_call1((void *)vmalloc_fn, len);
+}
+
+static inline void kc_vfree(void *p)
+{
+    (void)kp_call1((void *)vfree_fn, (unsigned long)p);
+}
+
+static inline void *kc_filp_open(const char *path, int flags, int mode)
+{
+    return (void *)kp_call3((void *)filp_open_fn, (unsigned long)path,
+                            (unsigned long)flags, (unsigned long)mode);
+}
+
+static inline int kc_filp_close(void *filp, void *id)
+{
+    return (int)kp_call2((void *)filp_close_fn,
+                         (unsigned long)filp, (unsigned long)id);
+}
+
+static inline long kc_kernel_read(void *file, void *buf, size_t n, void *pos)
+{
+    return (long)kp_call4((void *)kernel_read_fn, (unsigned long)file,
+                          (unsigned long)buf, (unsigned long)n, (unsigned long)pos);
+}
+
+static inline long kc_vfs_llseek(void *filp, long off, int whence)
+{
+    return (long)kp_call3((void *)vfs_llseek_fn, (unsigned long)filp,
+                          (unsigned long)off, (unsigned long)whence);
+}
+
+
 static bool g_selinux_ready;
 static bool g_dirty_policy_seen;
 static void *g_first_policydb;
