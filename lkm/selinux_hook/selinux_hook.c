@@ -1083,9 +1083,6 @@ struct symbol_cache_entry {
     bool suffixed;
 };
 
-typedef int (*kallsyms_on_each_symbol_nomod_fn)(int (*fn)(void *, const char *, unsigned long),
-                                                void *data);
-
 #define SYMBOL_CACHE_ENTRY(name) { name, 0, 0, false, false }
 
 static struct symbol_cache_entry g_symbol_cache[] = {
@@ -1289,22 +1286,7 @@ static void resolve_required_symbols_once(void)
 
     prepare_symbol_cache();
 
-    /* kallsyms_on_each_symbol cannot be referenced by name.
-     *
-     * Two independent problems:
-     *   1. It is a linked symbol here, so "&kallsyms_on_each_symbol" is a
-     *      compile-time constant and "if (!fn)" is always false (-Werror).
-     *   2. Its signature differs per kernel: (cb, data) before 6.4,
-     *      (cb, data, struct module *) from 6.4 on, and some vendor 5.10 trees
-     *      backported the module argument. Any cast from the declared function
-     *      type to a fixed prototype is rejected on at least one of those.
-     *
-     * Take the address by name through the assembler instead: "adrp/add" yields
-     * a plain integer, so no function-pointer type is involved and the cast to
-     * whatever prototype is needed at runtime is free of -Wincompatible-*
-     * diagnostics. kallsyms_walk() then calls it with the argument count that
-     * matches the running kernel. */
-    /* One lookup per name. g_symbol_cache[] already stores the exact name, and
+        /* One lookup per name. g_symbol_cache[] already stores the exact name, and
      * kallsyms_lookup_name returns 0 when a symbol is absent - which the loop
      * below counts as "missing" rather than fatal. */
     for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
@@ -1328,7 +1310,7 @@ static void resolve_required_symbols_once(void)
     walk_complete = walk_rc == 0 && found > 0;
 
     if (found == 0) {
-        pr_warn("[selinux_hook] kallsyms_on_each_symbol returned no symbols, falling back to kallsyms_lookup_name\n");
+        pr_warn("[selinux_hook] symbol cache incomplete, some hooks will be skipped\n");
         for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
             unsigned long addr;
             addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
