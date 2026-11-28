@@ -47,9 +47,20 @@
 #include "../infra/secpass.h"
 #include <hook.h>
 
-static int kp_stage = 5;
-module_param(kp_stage, int, 0644);
-MODULE_PARM_DESC(kp_stage, "Bring-up stage 0-5 (default 5, full module)");
+/* There is deliberately NO module parameter here.
+ *
+ * module_param(x, int, ...) expands to a reference to param_ops_int, which is
+ * declared in <linux/moduleparam.h> but not exported by this kernel
+ * (kernel/params.c has no EXPORT_SYMBOL for it). Naming it at all leaves an
+ * undefined symbol and insmod refuses the module.
+ *
+ * Staged bring-up is therefore compile-time: KP_BRINGUP_STAGE is set through
+ * ccflags in the Kbuild, so a diagnostic build is a rebuild rather than a
+ * parameter. For normal use it stays at the last stage, i.e. full module. */
+#ifndef KP_BRINGUP_STAGE
+#define KP_BRINGUP_STAGE 5
+#endif
+#define kp_stage KP_BRINGUP_STAGE
 
 /* selinux_hook was Admirepowered/selinux_hook, distributed as a .kpm. It now
  * compiles into kernelpatch.ko: the KPM header macros became plain constants
