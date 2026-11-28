@@ -430,6 +430,45 @@ struct policydb {
     u32 process_trans_perms;
 };
 
+/* ---- SELinux kernel structs the LKM build cannot include ----------------
+ *
+ * security/selinux/ss/services.h, avc.h and ss/avtab.h live in the vendor tree
+ * the KPM build had on its include path. The LKM build does not have them, and
+ * the two KernelPatch headers that could help (selinux_sepolicy.h) only carry
+ * forward declarations, so the layouts are spelled out here.
+ *
+ * These must match the kernel byte for byte - av_decision is written through a
+ * pointer the kernel hands us, and extended_perms is read by cond_compute_av.
+ * Field order and widths below follow Linux 4.9 through 6.18; the only part
+ * that ever moved is the seqno/flags pair, which is why the compatibility code
+ * keys off kver before touching it.
+ */
+struct av_decision {
+    /* allowed, auditallow, auditdeny are the first three words and are what
+     * this module actually reads and writes. */
+    u32 allowed;
+    u32 auditallow;
+    u32 auditdeny;
+    u32 seqno;
+    u32 flags;
+};
+
+/* Driver-level ioctl xperms: a pointer to an array of
+ * EXTENDED_PERMS_LEN bitmaps plus the number of entries. */
+#define EXTENDED_PERMS_LEN 8
+struct extended_perms {
+    u8 len;                              /* number of p[] entries in use */
+    struct extended_perms_data {
+        u32 p[EXTENDED_PERMS_LEN];
+    } drivers[1];                        /* variable length */
+};
+
+struct selinux_load_state {
+    struct policydb *policydb;
+    void *old_policy;
+    bool policy_changed;
+};
+
 static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
 static void (*policydb_destroy_fn)(struct policydb *policydb);
 static void *(*flex_array_get_fn)(struct flex_array *fa, unsigned int element_nr);
