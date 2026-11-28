@@ -8,6 +8,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
+#include <linux/sched/task_stack.h>
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
@@ -135,12 +136,35 @@ static bool kp_hook_region_ok(void *p, unsigned long size)
 
 	if (!p)
 		return false;
-	/* vmalloc/module area only. kmalloc'd memory must never land here, and a
-	 * stack or text address certainly must not. */
-	if (!is_vmalloc_addr(p))
-		return false;
 	if (a + size < a)		/* overflow */
 		return false;
+
+	/* Reject anything that is not in the vmalloc/module area. This is the
+	 * cheap first filter, NOT a sufficient one - see the stack check below. */
+	if (!is_vmalloc_addr(p))
+		return false;
+
+	/*
+	 * VMAP_STACK puts kernel thread stacks INSIDE the vmalloc area, so
+	 * is_vmalloc_addr() happily accepts a stack address. That is exactly how
+	 * this module died: kp_hook_exec_alloc() returned a stack pointer
+	 * (ffffffc0adfd3788, just below sp), the caller memset 4K over it, the
+	 * DC ZVA in __memset ran into the 16K stack guard page (PTE = 0), and the
+	 * resulting Oops escalated to panic and then to a watchdog reset.
+	 *
+	 * object_is_on_stack() is the kernel's own answer to "is this a stack
+	 * address", and it handles VMAP_STACK as well as the older thread_info
+	 * layout. Use it instead of trying to reason about address ranges.
+	 */
+	if (object_is_on_stack(p))
+		return false;
+
+	/* Also reject the module image itself and any other kernel text/data the
+	 * allocator should never have returned. A module_alloc result is always
+	 * in the vmalloc area and never inside the running module's own ranges. */
+	if (a >= (unsigned long)&_stext && a < (unsigned long)&_end)
+		return false;
+
 	return true;
 }
 
