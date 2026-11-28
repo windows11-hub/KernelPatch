@@ -9,6 +9,8 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/version.h>
+#include <linux/sched/task.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
@@ -41,6 +43,7 @@ struct selinux_load_state;
  * from kputils.c, which compiles in the KernelPatch world where those shims are
  * correct. */
 extern int __must_check compat_copy_to_user(void __user *to, const void *from, int n);
+extern long compat_strncpy_from_user(char *dest, const char __user *src, long count);
 
 /* KernelPatch runtime symbols that <common.h> declares. That header cannot be
  * included here: it also declares the kpimg link-time markers (_kp_start,
@@ -54,8 +57,7 @@ extern uint32_t kver;
  * which drags in the userland compiler shims. */
 /* KernelPatch keeps the resolved offsets in this struct (kputils.h). */
 struct kp_task_struct_offset {
-    int task_in_thread_info_offset;
-    int thread_info_in_task_offset;
+    int tasks_offset;      /* task_struct.tasks - list_head for the walk */
     int comm_offset;
     int cred_offset;
     int real_cred_offset;
@@ -80,6 +82,7 @@ static inline const char *kp_task_comm(const struct task_struct *tsk)
 #else
     __get_task_comm(buf, sizeof(buf), (struct task_struct *)tsk);
 #endif
+    buf[TASK_COMM_LEN - 1] = '\0';
     return buf;
 }
 
@@ -366,6 +369,14 @@ struct avtab_key {
 #define AVTAB_XPERMS_IOCTLFUNCTION 0x01
 #define AVTAB_XPERMS_IOCTLDRIVER 0x02
 
+/* 256 bits of ioctl permissions. Declared here rather than in the
+ * extended_perms block above because avtab_extended_perms embeds it by value
+ * and is defined first. */
+#define EXTENDED_PERMS_LEN 8
+struct extended_perms_data {
+    u32 p[EXTENDED_PERMS_LEN];
+};
+
 struct avtab_extended_perms {
     u8 specified;
     u8 driver;
@@ -475,12 +486,9 @@ struct av_decision {
 #define EXTENDED_PERMS_LEN 8
 struct extended_perms {
     u32 len;
-    union {
-        struct extended_perms_data {
-            u32 p[EXTENDED_PERMS_LEN];
-        } drivers;
-        u32 raw[EXTENDED_PERMS_LEN];
-    };
+    struct extended_perms_data {
+        u32 p[EXTENDED_PERMS_LEN];
+    } drivers;
 };
 
 /* security/selinux/include/security.h: what security_load_policy() fills in.
@@ -490,6 +498,7 @@ struct selinux_load_state {
     void *old_policy;
     struct selinux_policy *new_policy;
     struct selinux_policy *policy;      /* this is what the callers read */
+    void *convert_data;                 /* sidtab conversion bookkeeping */
     bool policy_changed;
 };
 
@@ -1534,6 +1543,13 @@ static unsigned int ebitmap_next_positive_intel(struct ebitmap *e,
          (bit) < (e)->highbit; \
          (bit) = ebitmap_next_positive_intel((e), &(n), (bit)))
 
+/* security/selinux/ss/services.h declares this inline; the LKM build has no
+ * copy, so define the one-liner here. */
+static inline void security_xperm_set(u32 *perms, u8 bit)
+{
+    perms[bit >> 5] |= 1U << (bit & 0x1f);
+}
+
 static void services_compute_xperms_drivers_intel(struct extended_perms *xperms,
                                                   struct avtab_node *node)
 {
@@ -1900,7 +1916,7 @@ static bool magiskinit_process_exists(void)
         return false;
 
     for (task = init; (task = next_task(task)) != init;) {
-        if (str_eq_lit(get_task_comm(task), "magiskinit"))
+        if (str_eq_lit(kp_task_comm(task), "magiskinit"))
             return true;
     }
 
