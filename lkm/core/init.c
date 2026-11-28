@@ -2,8 +2,24 @@
 /*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  *
- * KernelPatch LKM entry. Loads via insmod, resolves symbols, scans for the
- * trusted APatch manager, and hooks syscall 45 as the supercall channel.
+ * KernelPatch LKM entry, "pure KernelPatch" shape.
+ *
+ * What this module is now:
+ *   - the inline hook engine and its trampoline runtime (hook/)
+ *   - symbol resolution and kernel text/memory patching (infra/)
+ *   - credential switching (supercall/accctl.c: kp_commit_su / kp_task_su)
+ *   - selinux_hook, linked in rather than loaded as a .kpm
+ *
+ * What was removed and why:
+ *   - kpm/  the KPM loader. selinux_hook used to be a .kpm; it is a normal
+ *     object in this module now, so nothing needs a runtime loader.
+ *   - supercall/  the syscall-45 channel plus dispatch, su and kstorage. With
+ *     it goes every syscall-table hook this module used to install.
+ *   - supercall/sucompat*  the execve redirect.
+ *   - infra/syscall_table.c  only the two items above used it.
+ *
+ * Consequence, stated plainly: there is no syscall hook left, and no supercall
+ * channel for a manager app to talk to. This module only does inline hooks.
  */
 #include <linux/module.h>
 #include <linux/version.h>
@@ -11,16 +27,23 @@
 #include "../include/kp_lkm.h"
 #include "../infra/patch_memory.h"
 #include "../infra/symbol_resolver.h"
-#include "../infra/syscall_table.h"
 #include "../hook/hook_runtime.h"
 #include "../manager/manager.h"
 #include "../supercall/accctl.h"
-#include "../supercall/kstorage.h"
-#include "../supercall/sucompat.h"
-#include "../supercall/sucompat_hook.h"
-#include "../supercall/supercall.h"
-#include "../kpm/module.h"
 #include "../infra/secpass.h"
+
+/* selinux_hook was Admirepowered/selinux_hook, distributed as a .kpm. It now
+ * compiles into kernelpatch.ko: the KPM header macros became plain constants
+ * and the KPM_INIT/KPM_CTL0/KPM_EXIT entry points became these functions.
+ *
+ * It answers selinuxfs queries (/sys/fs/selinux/access, /context, the procattr
+ * writes, the status reads) with the clean-policy result, so a caller probing
+ * for Magisk types gets EINVAL exactly as it would on an unmodified device.
+ * That is what kp_selinux_bypass_init() in accctl.c used to fake from the
+ * opposite direction; running both would make compute_av and avc_has_perm
+ * disagree, so the bypass was deleted when this was linked in. */
+extern long selinux_hook_init(const char *args, const char *event, void *__user r);
+extern long selinux_hook_exit(void *__user r);
 
 /*
  * Some A12-5.10 third-party kernels advertise CC_HAVE_STACKPROTECTOR_SYSREG but
@@ -63,30 +86,13 @@ int __init kernelpatch_init(void)
 
 	kp_symres_init();
 
-	rc = kp_syscall_table_init();
-	if (rc)
-		return rc;
-
 	rc = kp_patch_memory_init();
-	if (rc)
-		return rc;
-
-	rc = kp_kstorage_init();
 	if (rc)
 		return rc;
 
 	rc = kp_accctl_init();
 	if (rc)
 		return rc;
-
-	rc = kp_sucompat_init();
-	if (rc)
-		return rc;
-
-	/* Auto-apply APatch config (su path + package allowlist) from
-	 * /data/adb/ap. Only used on jailbroken devices where those files exist
-	 * at insmod time; the supercall path remains the manager's fallback. */
-	kp_su_load_config();
 
 	rc = kp_hook_runtime_init();
 	if (rc)
@@ -99,45 +105,18 @@ int __init kernelpatch_init(void)
 	if (rc)
 		logkw("CFI bypass failed: %d\n", rc);
 
-	rc = kp_kpm_init();
-	if (rc)
-		logkw("kpm loader init failed: %d (KPM supercalls will return -ENOSYS)\n", rc);
-
-	/* Denials for root-granted uids must be decided as allows, otherwise the
-	 * process has uid 0 and full caps but still cannot open /data/adb. Runs
-	 * after kp_hook_runtime_init() because it needs the trampoline allocator. */
-	rc = kp_selinux_bypass_init();
-	if (rc)
-		logkw("selinux bypass init failed: %d\n", rc);
-
-	rc = kp_supercall_install();
-	if (rc)
-		return rc;
-
-	rc = kp_sucompat_hook_init();
-	if (rc)
-		return rc;
-
-	/* Synchronous manager scan; runs in the caller's (root) context so SELinux
-	 * allows reading /data. The appid may still be invalid if the manager is
-	 * not installed yet; the supercall handler re-checks per call. */
+	/* Scan for the trusted manager. Runs in the caller's (root) context so
+	 * SELinux allows reading /data. Nothing in this module depends on the
+	 * result any more - it is kept because accctl/apk_sign support it and a
+	 * future caller may want kp_is_manager_uid() - so a miss is not fatal. */
 	kp_manager_init();
 
-#if 0 /* Do NOT enable - same KCFI trap as the getname_flags hook.
-       *
-       * This runs inside the VFS rename path with inode locks held, and the
-       * trampoline it installs goes through the same KCFI-checked stub that
-       * panicked with "kernel stack overflow" at 70s (see the long comment in
-       * supercall/sucompat_hook.c for the trace). Being inside the fs layer
-       * only makes it worse: there is no safe unwinding point there.
-       *
-       * Manager recognition across an app update is handled without a hook:
-       * manager/apk_sign.c now falls back to the package name in the
-       * /data/app/<pkg>-<suffix>/ path, and manager/manager.c rescans on the
-       * next supercall instead of relying on a rename event.
-       */
-	hook_rename_lsm();
-#endif
+	/* Filter the selinuxfs query surface. Must run after kp_hook_runtime_init()
+	 * (it needs the trampoline allocator) and last of all, because it snapshots
+	 * the live policy and that policy must be fully committed by now. */
+	rc = (int)selinux_hook_init(NULL, "lkm", NULL);
+	if (rc)
+		logkw("selinux_hook init failed: %d\n", rc);
 
 	logki("KernelPatch LKM ready\n");
 	return 0;
@@ -145,11 +124,9 @@ int __init kernelpatch_init(void)
 
 static void __exit kernelpatch_exit(void)
 {
-	kp_sucompat_hook_exit();
-	hook_rename_lsm_exit();
-	kp_supercall_uninstall();
-	/* Unhook the CFI bypass last so it shields the other teardown from
-	 * spurious CFI failures on LKM/KPM text. */
+	selinux_hook_exit(NULL);
+	/* Unhook the CFI bypass last so it shields the teardown above from
+	 * spurious CFI failures on LKM text. */
 	kp_bypass_kcfi_exit();
 	logki("KernelPatch LKM unloaded\n");
 }
