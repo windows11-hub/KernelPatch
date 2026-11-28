@@ -48,6 +48,14 @@ static void (*kp_hook_execmem_free)(void *ptr);
 #endif
 static void *(*kp_hook_module_alloc)(unsigned long size);
 static void (*kp_hook_module_memfree)(void *region);
+/* __vmalloc_node_range: the only exported call that returns executable memory
+ * in one step on this kernel. Typed with the 6.6 argument list. */
+typedef void *(*kp_vmalloc_range_t)(unsigned long size, unsigned long align,
+				    unsigned long start, unsigned long end,
+				    gfp_t gfp_mask, pgprot_t prot,
+				    unsigned long vm_flags, int node,
+				    const void *caller);
+static kp_vmalloc_range_t kp_hook_vmalloc_range;
 static void (*kp_hook_flush_icache_all)(void);
 static int (*kp_hook_set_memory_x)(unsigned long addr, int numpages);
 
@@ -163,140 +171,103 @@ static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
  * CFI-instrumented caller, the compiler emits a kCFI type-hash load of
  * [fnptr - 4] that dereferences NULL when the allocator is absent (6.10+ has
  * no module_alloc) and panics. no_sanitize keeps the indirect calls unchecked. */
-/* Is @p a plausible kernel allocation we may hand to memset and patch?
- *
- * This check exists because of a real crash: kp_resolve_symbol("module_alloc")
- * resolved to something that was not module_alloc on a 6.6 GKI kernel, the call
- * returned a stack address, and kp_hook_mem_zalloc() memset it - the DC ZVA in
- * __memset ran off the 16K VMAP_STACK into the guard page and the Oops escalated
- * to panic (panic_on_oops=1) and then to a hypervisor watchdog reset.
- *
- * Rejecting the value here turns "kernel dies with no usable trace" into "hook
- * not installed, one warning in dmesg". */
+/* Is @p a plausible kernel allocation we may hand to memset and patch? */
 static bool kp_hook_region_ok(void *p, unsigned long size)
 {
 	unsigned long a = (unsigned long)p;
 
 	if (!p)
 		return false;
-	if (a + size < a)		/* overflow */
+	if (a + size < a)
 		return false;
-
-	/* Reject anything that is not in the vmalloc/module area. This is the
-	 * cheap first filter, NOT a sufficient one - see the stack check below. */
 	if (!is_vmalloc_addr(p))
 		return false;
-
-	/*
-	 * VMAP_STACK puts kernel thread stacks INSIDE the vmalloc area, so
-	 * is_vmalloc_addr() happily accepts a stack address. That is exactly how
-	 * this module died: kp_hook_exec_alloc() returned a stack pointer
-	 * (ffffffc0adfd3788, just below sp), the caller memset 4K over it, the
-	 * DC ZVA in __memset ran into the 16K stack guard page (PTE = 0), and the
-	 * resulting Oops escalated to panic and then to a watchdog reset.
-	 *
-	 * object_is_on_stack() would be the natural check, but it is a static
-	 * inline over task_stack_page(current) and the compiler proves it false
-	 * for a value returned by an indirect call - the whole test is eliminated
-	 * (verified in the built object: no reference to it survives). Compare
-	 * against the current stack range through a volatile pointer instead, so
-	 * the compiler must keep the comparison.
-	 */
 	{
 		volatile unsigned long stack_base =
 			(unsigned long)task_stack_page(current);
 		unsigned long limit = stack_base + THREAD_SIZE;
-		unsigned long a2 = a;
 
-		if (a2 >= stack_base && a2 < limit)
+		if (a >= stack_base && a < limit)
 			return false;
-		/* Also reject the guard gap just below and above the stack: a 4K
-		 * memset starting near the top would still cross into the guard
-		 * page, which has no PTE. */
-		if (a2 + size > stack_base && a2 < limit)
+		if (a + size > stack_base && a < limit)
 			return false;
 	}
-
-	/*
-	 * Do NOT compare against &_stext / &_end here.
-	 *
-	 * Those are linker-generated absolute symbols for the kernel image. They
-	 * are not in EXPORT_SYMBOL, so a module that references them gets
-	 * "Unknown symbol _stext" from the loader. They were in the first version
-	 * of this check and are why the module could not load at all.
-	 *
-	 * The vmalloc-area test above already excludes kernel text: on arm64 the
-	 * image lives in the linear map, not in the vmalloc range, and module
-	 * memory is in MODULES_VADDR..MODULES_END inside the vmalloc area. That is
-	 * sufficient to reject text and stack, which is all this needs to do.
-	 */
 	return true;
 }
 
+/*
+ * Allocate executable memory for a hook trampoline.
+ *
+ * Everything below is built around what the OPPO 6.6 kernel actually exports
+ * (checked against oppo-source/android_kernel_oppo_sm8750, sm8750_b_16.0.0):
+ *
+ *   arch/arm64/mm/pageattr.c exports only set_direct_map_invalid_noflush and
+ *   set_direct_map_default_noflush. set_memory_x / set_memory_nx are NOT
+ *   exported, so "vmalloc + set_memory_x" cannot work: the call resolves to
+ *   NULL, is skipped, and the trampoline ends up in a page with PXN=1. The
+ *   first BR into it faults, the Oops escalates to panic, the watchdog resets
+ *   the phone. That is exactly the crash loop this module was stuck in.
+ *
+ *   kernel/module/main.c marks module_alloc and module_memfree __weak and does
+ *   not export them either.
+ *
+ * The one call that does the whole job in a single step is
+ * __vmalloc_node_range() with PAGE_KERNEL_EXEC: it allocates inside
+ * MODULES_VADDR..MODULES_END and maps the pages executable from the start, so
+ * no second pass over the page tables is needed.
+ *
+ * If that is unavailable, fall back to the old sequence only when both halves
+ * exist (an allocator AND set_memory_x), because half of it is worse than
+ * failing: a non-executable trampoline is a guaranteed fault later, while a
+ * refusal here just disables hooks.
+ */
 __attribute__((no_sanitize("cfi"), __noinline__))
 static void *kp_hook_exec_alloc(unsigned long size)
 {
 	void *p = NULL;
 	unsigned long pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
-	/* Direct calls. The function is already no_sanitize("cfi") and the
-	 * pointers carry their real prototypes, so kp_callN() buys nothing here
-	 * and only obscures the return value. */
-	/*
-	 * module_alloc() is deliberately NOT the first choice.
-	 *
-	 * It is safe once the module loader is fully up, but kernelpatch_init()
-	 * runs while this very module is still being initialised, and module_alloc
-	 * consults module loader state (get_module_load_offset(), the delayed
-	 * loading flag) that is not settled yet. A call there can hand back a
-	 * pointer that is not module memory at all - which is how this module
-	 * ended up memsetsetting a kernel stack address and dying on the 16K
-	 * VMAP_STACK guard page.
-	 *
-	 * vmalloc + set_memory_x is the well-defined path from any context, and
-	 * execmem_alloc is the 6.11+ replacement for exactly this use. Only fall
-	 * back to module_alloc when neither exists. */
-	if (kp_hook_execmem_alloc) {
-		p = kp_hook_execmem_alloc(0 /* EXECMEM_MODULE_TEXT */, size);
-		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: execmem_alloc(%lu) returned %px, rejected\n",
-			      size, p);
+	/* Preferred: one call, executable from the start. */
+	if (kp_hook_vmalloc_range) {
+		p = kp_hook_vmalloc_range(size, PAGE_SIZE,
+					  VMALLOC_START, VMALLOC_END,
+					  GFP_KERNEL | __GFP_ZERO,
+					  PAGE_KERNEL_EXEC,
+					  VM_FLUSH_RESET_PERMS,
+					  NUMA_NO_NODE,
+					  __builtin_return_address(0));
+		if (p && kp_hook_region_ok(p, size)) {
+			logki("exec_alloc: %lu bytes at %px (vmalloc_range, exec)\n", size, p);
+			return p;
+		}
+		if (p) {
+			logkw("exec_alloc: vmalloc_range returned %px, rejected\n", p);
+			vfree(p);
 			p = NULL;
 		}
 	}
-	if (!p) {
-		p = vmalloc(size);
-		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: vmalloc(%lu) returned %px, rejected\n", size, p);
-			p = NULL;
+
+	/* Secondary: a plain allocation plus an explicit permission change, but
+	 * ONLY when both pieces resolved. Without set_memory_x the result would be
+	 * non-executable and every later BR would fault. */
+	if (kp_hook_module_alloc && kp_hook_set_memory_x) {
+		void *q = kp_hook_module_alloc(size);
+
+		if (q && kp_hook_region_ok(q, size)) {
+			(void)kp_call2((void *)kp_hook_set_memory_x,
+				       (unsigned long)q, (unsigned long)pages);
+			logki("exec_alloc: %lu bytes at %px (module_alloc + set_memory_x)\n",
+			      size, q);
+			return q;
 		}
 	}
-	if (!p && kp_hook_module_alloc) {
-		/* Last resort only; see the note above. */
-		logkw("exec_alloc: falling back to module_alloc\n");
-		p = kp_hook_module_alloc(size);
-		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: module_alloc(%lu) returned %px, rejected\n",
-			      size, p);
-			p = NULL;
-		}
-	}
-	if (!p) {
-		logke("exec_alloc: no usable executable memory for %lu bytes\n", size);
-		return NULL;
-	}
-	/* GKI module_alloc returns PAGE_KERNEL (PXN set, NX); vmalloc too. Hook
-	 * trampolines live here and must be executable. */
-	if (kp_hook_set_memory_x)
-		(void)kp_call2((void *)kp_hook_set_memory_x, (unsigned long)p, (unsigned long)pages);
-	/*
-	 * set_memory_x only grants execution. The GP bit is still set, so the
-	 * CPU keeps enforcing BTI on these pages and any BR into the trampoline
-	 * faults. Clear PXN/UXN/GP so the trampoline is enterable by BR, which
-	 * is how hook_chain_prepare() transfers control (LDR X16 + BR X16).
-	 */
-	kp_hook_clear_exec_bits((unsigned long)p, pages << PAGE_SHIFT);
-	return p;
+
+	logke("exec_alloc: no executable-memory path for %lu bytes "
+	      "(vmalloc_range=%px module_alloc=%px set_memory_x=%px); "
+	      "hooks disabled\n",
+	      size, (void *)kp_hook_vmalloc_range,
+	      (void *)kp_hook_module_alloc, (void *)kp_hook_set_memory_x);
+	return NULL;
 }
 
 __attribute__((no_sanitize("cfi"), __noinline__))
