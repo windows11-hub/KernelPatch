@@ -192,18 +192,24 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	/* Direct calls. The function is already no_sanitize("cfi") and the
 	 * pointers carry their real prototypes, so kp_callN() buys nothing here
 	 * and only obscures the return value. */
-	if (kp_hook_module_alloc) {
-		p = kp_hook_module_alloc(size);
-		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: module_alloc(%lu) returned %px, not a vmalloc region\n",
-			      size, p);
-			p = NULL;
-		}
-	}
-	if (!p && kp_hook_execmem_alloc) {
+	/*
+	 * module_alloc() is deliberately NOT the first choice.
+	 *
+	 * It is safe once the module loader is fully up, but kernelpatch_init()
+	 * runs while this very module is still being initialised, and module_alloc
+	 * consults module loader state (get_module_load_offset(), the delayed
+	 * loading flag) that is not settled yet. A call there can hand back a
+	 * pointer that is not module memory at all - which is how this module
+	 * ended up memsetsetting a kernel stack address and dying on the 16K
+	 * VMAP_STACK guard page.
+	 *
+	 * vmalloc + set_memory_x is the well-defined path from any context, and
+	 * execmem_alloc is the 6.11+ replacement for exactly this use. Only fall
+	 * back to module_alloc when neither exists. */
+	if (kp_hook_execmem_alloc) {
 		p = kp_hook_execmem_alloc(0 /* EXECMEM_MODULE_TEXT */, size);
 		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: execmem_alloc(%lu) returned %px, not a vmalloc region\n",
+			logkw("exec_alloc: execmem_alloc(%lu) returned %px, rejected\n",
 			      size, p);
 			p = NULL;
 		}
@@ -211,7 +217,17 @@ static void *kp_hook_exec_alloc(unsigned long size)
 	if (!p) {
 		p = vmalloc(size);
 		if (!kp_hook_region_ok(p, size)) {
-			logkw("exec_alloc: vmalloc(%lu) returned %px\n", size, p);
+			logkw("exec_alloc: vmalloc(%lu) returned %px, rejected\n", size, p);
+			p = NULL;
+		}
+	}
+	if (!p && kp_hook_module_alloc) {
+		/* Last resort only; see the note above. */
+		logkw("exec_alloc: falling back to module_alloc\n");
+		p = kp_hook_module_alloc(size);
+		if (!kp_hook_region_ok(p, size)) {
+			logkw("exec_alloc: module_alloc(%lu) returned %px, rejected\n",
+			      size, p);
 			p = NULL;
 		}
 	}
