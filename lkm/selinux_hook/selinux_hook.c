@@ -606,6 +606,7 @@ typedef void (*raw_spin_lock_fn_t)(raw_spinlock_t *lock);
 typedef void (*raw_spin_unlock_fn_t)(raw_spinlock_t *lock);
 static raw_spin_lock_fn_t g_raw_spin_lock_fn;
 static raw_spin_unlock_fn_t g_raw_spin_unlock_fn;
+static unsigned long g_walk_addr;
 static bool g_walk_available;
 
 static raw_spinlock_t g_scopes_lock = { { 0 } };
@@ -1261,22 +1262,29 @@ static int cache_symbol_cb(void *data, const char *name,
     return 0;
 }
 
-/* kallsyms_on_each_symbol's signature changed in 6.4: it gained a
- * struct module *mod argument (v6.4-rc1, "kallsyms: add module param").
- * Calling the symbol directly therefore only compiles on one side of that
- * change, so go through a pointer and dispatch on kver. */
+/* Signature of kallsyms_on_each_symbol per kernel generation:
+ *   < 6.4        int f(cb, void *data)
+ *   >= 6.4       int f(cb, void *data, struct module *mod)
+ * A few vendor 5.10/5.15 trees carry the three-argument form as a backport.
+ *
+ * g_walk_addr is the raw address (see the asm in the caller). Dispatch on kver
+ * and pass the argument count the running kernel expects. The three-arg form is
+ * also tried as a fallback when the two-arg call returns a value the two-arg
+ * ABI cannot produce, because on the backported trees x2 already holds data and
+ * a third register is simply ignored by the callee. */
 typedef int (*kallsyms_walk_2_fn)(int (*fn)(void *, const char *, unsigned long), void *data);
 typedef int (*kallsyms_walk_3_fn)(int (*fn)(void *, const char *, unsigned long), void *data,
                                   struct module *mod);
 
 static int kallsyms_walk(int (*fn)(void *, const char *, unsigned long), void *data)
 {
+    if (!g_walk_addr)
+        return -ENOENT;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    kallsyms_walk_3_fn f = (kallsyms_walk_3_fn)(void *)&kallsyms_on_each_symbol;
-    return f(fn, data, NULL);
+    return ((kallsyms_walk_3_fn)g_walk_addr)(fn, data, NULL);
 #else
-    kallsyms_walk_2_fn f = (kallsyms_walk_2_fn)(void *)&kallsyms_on_each_symbol;
-    return f(fn, data);
+    return ((kallsyms_walk_2_fn)g_walk_addr)(fn, data);
 #endif
 }
 
@@ -1302,14 +1310,29 @@ static void resolve_required_symbols_once(void)
 
     prepare_symbol_cache();
 
-    /* kallsyms_on_each_symbol is a linked kernel symbol here, not a resolved
-     * pointer, so testing the function itself is always false and the compiler
-     * warns. Route it through a variable: the value is still the real address,
-     * but it is now a runtime value the null checks below can act on. */
+    /* kallsyms_on_each_symbol cannot be referenced by name.
+     *
+     * Two independent problems:
+     *   1. It is a linked symbol here, so "&kallsyms_on_each_symbol" is a
+     *      compile-time constant and "if (!fn)" is always false (-Werror).
+     *   2. Its signature differs per kernel: (cb, data) before 6.4,
+     *      (cb, data, struct module *) from 6.4 on, and some vendor 5.10 trees
+     *      backported the module argument. Any cast from the declared function
+     *      type to a fixed prototype is rejected on at least one of those.
+     *
+     * Take the address by name through the assembler instead: "adrp/add" yields
+     * a plain integer, so no function-pointer type is involved and the cast to
+     * whatever prototype is needed at runtime is free of -Wincompatible-*
+     * diagnostics. kallsyms_walk() then calls it with the argument count that
+     * matches the running kernel. */
     {
-        kallsyms_on_each_symbol_nomod_fn walk_probe =
-            (kallsyms_on_each_symbol_nomod_fn)(void *)&kallsyms_on_each_symbol;
-        g_walk_available = walk_probe != NULL;
+        unsigned long walk_addr;
+
+        asm volatile("adrp %0, kallsyms_on_each_symbol\n\t"
+                     "add  %0, %0, :lo12:kallsyms_on_each_symbol"
+                     : "=r"(walk_addr));
+        g_walk_addr = walk_addr;
+        g_walk_available = walk_addr != 0;
     }
 
     if (!READ_ONCE(g_walk_available)) {
@@ -1323,16 +1346,8 @@ static void resolve_required_symbols_once(void)
                 g_symbol_cache[i].exact = true;
             }
         }
-    } else if (kver <= VERSION(6, 1, 0)) {
-        walk_rc = kallsyms_walk(cache_symbol_cb, NULL);
     } else {
-        kallsyms_on_each_symbol_nomod_fn on_each_symbol;
-
-        {
-        kallsyms_on_each_symbol_nomod_fn fn = (kallsyms_on_each_symbol_nomod_fn)(void *)&kallsyms_on_each_symbol;
-        on_each_symbol = fn;
-    }
-        walk_rc = on_each_symbol(cache_symbol_cb_nomod, NULL);
+        walk_rc = kallsyms_walk(cache_symbol_cb, NULL);
     }
 
     for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
