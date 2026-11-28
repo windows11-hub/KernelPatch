@@ -482,25 +482,36 @@ struct av_decision {
     u32 flags;
 };
 
-/* Userspace-facing xperms accumulator (security/selinux/include/avc_ss.h).
- * len is the number of populated driver entries; drivers is a single bitmap
- * that the services code ORs ioctl permission words into. An anonymous union
- * lets the services code reach it as xperms->drivers.p without the nested
- * struct spelling. */
+/* security/selinux/include/security.h, verbatim:
+ *
+ *   struct extended_perms {
+ *       u16 len;
+ *       struct extended_perms_data drivers;
+ *   };
+ *
+ * The field is u16 in the source. Declaring it u32 shifts drivers by 4 bytes,
+ * and services_compute_xperms_drivers() then ORs ioctl permission words into
+ * the wrong offsets - silent corruption of the caller's struct, which for
+ * context_struct_compute_av lives on the AVC stack frame. */
 struct extended_perms {
-    u32 len;
+    u16 len;
     struct extended_perms_data drivers;
 };
 
-/* security/selinux/include/security.h: what security_load_policy() fills in.
- * Only ->policy is touched - it is handed to read_policy_sidtab() - so the rest
- * is spelled out to keep the size right without depending on those names. */
+/* security/selinux/include/security.h, verbatim:
+ *
+ *   struct selinux_load_state {
+ *       struct selinux_policy *policy;
+ *       struct selinux_policy_convert_data *convert_data;
+ *   };
+ *
+ * Two pointers, nothing else. The extra fields the previous revision carried
+ * came from a different kernel generation and pushed ->policy to the wrong
+ * offset, so every read of load_state->policy loaded convert_data instead. */
+struct selinux_policy_convert_data;
 struct selinux_load_state {
-    void *old_policy;
-    struct selinux_policy *new_policy;
-    struct selinux_policy *policy;      /* this is what the callers read */
-    void *convert_data;                 /* sidtab conversion bookkeeping */
-    bool policy_changed;
+    struct selinux_policy *policy;
+    struct selinux_policy_convert_data *convert_data;
 };
 
 static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
