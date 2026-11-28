@@ -4655,14 +4655,14 @@ long selinux_hook_ctl0(const char* args, char* __user out_msg, int outlen) {
     sprintf(echo, "error, rc=%d\n", rc);
         logke("fg_sram_write %s", echo);
         if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
+            (void)compat_copy_to_user(out_msg, echo, sizeof(echo));
             return 1;
         }
     } else {
         sprintf(echo, "success resp\n");
         logki("fg_sram_write %s", echo);
         if (out_msg) {
-            compat_copy_to_user(out_msg, echo, sizeof(echo));
+            (void)compat_copy_to_user(out_msg, echo, sizeof(echo));
             return 0;
         }
     }
