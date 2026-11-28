@@ -1252,8 +1252,9 @@ static void cache_symbol_match(const char *name, unsigned long addr)
     }
 }
 
-static int cache_symbol_cb(void *data, const char *name,
-                           struct module *module, unsigned long addr)
+/* 4-argument callback (Linux >= 6.4, and vendor trees that backported it). */
+static int cache_symbol_cb4(void *data, const char *name,
+                            struct module *module, unsigned long addr)
 {
     (void)data;
     (void)module;
@@ -1262,29 +1263,43 @@ static int cache_symbol_cb(void *data, const char *name,
     return 0;
 }
 
-/* Signature of kallsyms_on_each_symbol per kernel generation:
- *   < 6.4        int f(cb, void *data)
- *   >= 6.4       int f(cb, void *data, struct module *mod)
- * A few vendor 5.10/5.15 trees carry the three-argument form as a backport.
- *
- * g_walk_addr is the raw address (see the asm in the caller). Dispatch on kver
- * and pass the argument count the running kernel expects. The three-arg form is
- * also tried as a fallback when the two-arg call returns a value the two-arg
- * ABI cannot produce, because on the backported trees x2 already holds data and
- * a third register is simply ignored by the callee. */
-typedef int (*kallsyms_walk_2_fn)(int (*fn)(void *, const char *, unsigned long), void *data);
-typedef int (*kallsyms_walk_3_fn)(int (*fn)(void *, const char *, unsigned long), void *data,
-                                  struct module *mod);
-
-static int kallsyms_walk(int (*fn)(void *, const char *, unsigned long), void *data)
+/* 3-argument callback (Linux < 6.4). */
+static int cache_symbol_cb3(void *data, const char *name, unsigned long addr)
 {
+    (void)data;
+
+    cache_symbol_match(name, addr);
+    return 0;
+}
+
+/* Signature of kallsyms_on_each_symbol per kernel generation:
+ *   < 6.4        int f(cb(void*, const char*, unsigned long), void *data)
+ *   >= 6.4       int f(cb(void*, const char*, struct module*, unsigned long),
+ *                      void *data, struct module *mod)
+ * Both the callback and the wrapper differ, so dispatch on kver and keep each
+ * form in its own branch. g_walk_addr is the raw address taken by the asm in
+ * the caller, so no declaration of the real prototype is involved.
+ */
+typedef int (*kallsyms_walk_3_fn)(int (*fn)(void *, const char *, unsigned long), void *data);
+typedef int (*kallsyms_walk_4_fn)(int (*fn)(void *, const char *, struct module *, unsigned long),
+                                  void *data, struct module *mod);
+
+static int kallsyms_walk(void *unused_data)
+{
+    (void)unused_data;
+
     if (!g_walk_addr)
         return -ENOENT;
 
+    /* kver is the running kernel, which need not match the header the build
+     * used (vendor backports), so prefer the 4-argument form whenever the
+     * kernel reports 6.4 or newer and fall back to the 3-argument one. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    return ((kallsyms_walk_3_fn)g_walk_addr)(fn, data, NULL);
+    return ((kallsyms_walk_4_fn)g_walk_addr)(cache_symbol_cb4, NULL, NULL);
 #else
-    return ((kallsyms_walk_2_fn)g_walk_addr)(fn, data);
+    if (kver >= VERSION(6, 4, 0))
+        return ((kallsyms_walk_4_fn)g_walk_addr)(cache_symbol_cb4, NULL, NULL);
+    return ((kallsyms_walk_3_fn)g_walk_addr)(cache_symbol_cb3, NULL);
 #endif
 }
 
@@ -1347,7 +1362,7 @@ static void resolve_required_symbols_once(void)
             }
         }
     } else {
-        walk_rc = kallsyms_walk(cache_symbol_cb, NULL);
+        walk_rc = kallsyms_walk(NULL);
     }
 
     for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
