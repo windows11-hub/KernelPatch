@@ -78,6 +78,12 @@ static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
 
 	if (!kp_hook_init_mm)
 		return;
+	/* Walking the page tables of a bogus address reads arbitrary memory at
+	 * *pgd. Only bracket the vmalloc area; anything else is not ours. */
+	if (!base || !is_vmalloc_addr((void *)base))
+		return;
+	if (size == 0 || size > (1UL << 24))
+		return;
 
 	end = base + size;
 	for (addr = base; addr < end; addr += PAGE_SIZE) {
@@ -96,20 +102,57 @@ static void kp_hook_clear_exec_bits(unsigned long base, unsigned long size)
 		pud = pud_offset(p4d, addr);
 		if (pud_none(*pud) || pud_bad(*pud))
 			continue;
-		if (pud_sect(*pud))
+		/* A PUD block mapping IS the leaf: there is no PTE below it. Patching
+		 * the block descriptor directly is the correct action, and silently
+		 * skipping it (as the previous version did) left 1GB/2MB mapped
+		 * trampoline pages with PXN still set - they then faulted on entry. */
+		if (pud_sect(*pud)) {
+			pteval_t bv = pud_val(*pud);
+
+			if (bv & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
+				pud_t nv = __pud((bv & ~(KP_HR_PTE_PXN | KP_HR_PTE_GP)) |
+						 KP_HR_PTE_UXN);
+				set_pud(pud, nv);
+				flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
+			}
 			continue;
+		}
 		pmd = pmd_offset(pud, addr);
 		if (pmd_none(*pmd) || pmd_bad(*pmd))
 			continue;
-		if (pmd_sect(*pmd))
+		if (pmd_sect(*pmd)) {
+			pteval_t bv = pmd_val(*pmd);
+
+			if (bv & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
+				pmd_t nv = __pmd((bv & ~(KP_HR_PTE_PXN | KP_HR_PTE_GP)) |
+						 KP_HR_PTE_UXN);
+				set_pmd(pmd, nv);
+				flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
+			}
 			continue;
+		}
 		pte = pte_offset_kernel(pmd, addr);
 		if (!pte || !pte_present(*pte))
 			continue;
 
+		/*
+		 * Clear PXN and GP only.
+		 *
+		 * PXN=1 means "no execution at EL1", so a trampoline page with it set
+		 * faults the moment the BR lands. GP=1 turns BTI back on for the page,
+		 * and a copied trampoline cannot satisfy BTI for arbitrary entries -
+		 * that is the whole reason this helper exists.
+		 *
+		 * UXN is NOT cleared. It means "no execution at EL0", and kernel pages
+		 * are supposed to keep it set: clearing it would make every trampoline
+		 * page a place user mode could branch into, which is a privilege
+		 * boundary hole for no functional gain. The trampoline is only ever
+		 * entered from EL1.
+		 */
 		v = pte_val(*pte);
-		if (v & (KP_HR_PTE_PXN | KP_HR_PTE_UXN | KP_HR_PTE_GP)) {
-			v &= ~(KP_HR_PTE_PXN | KP_HR_PTE_UXN | KP_HR_PTE_GP);
+		if (v & (KP_HR_PTE_PXN | KP_HR_PTE_GP)) {
+			v &= ~(KP_HR_PTE_PXN | KP_HR_PTE_GP);
+			v |= KP_HR_PTE_UXN;
 			set_pte(pte, __pte(v));
 			flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
 		}
