@@ -18,7 +18,12 @@
 #include <uapi/asm-generic/errno.h>
 #include <uapi/asm-generic/fcntl.h>
 #include <uapi/linux/fs.h>
-#include <security.h>
+/* <security.h> lives in the vendor tree (linux/security/selinux/include) that
+ * the KPM build has on its include path; the LKM build does not. Only one type
+ * from it is used - struct selinux_load_state, an opaque handle whose address
+ * is handed to security_load_policy() and never dereferenced - so declare it
+ * here rather than pull in a header we cannot reach. */
+struct selinux_load_state;
 #include <ksyms.h>
 #include <hook.h>
 
