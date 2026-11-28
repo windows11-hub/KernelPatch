@@ -114,7 +114,11 @@ static uint64_t *kp_pte_of(uint64_t va)
 	if (!kp_swapper_pg_dir)
 		return NULL;
 
-	pgd = pgd_offset_k(va);
+	/* pgd_offset_k() expands to &init_mm.pgd[...], and init_mm is not an
+	 * exported symbol on this kernel. swapper_pg_dir IS the kernel's top-level
+	 * table, so index it directly: the result is identical, without the
+	 * dependency on init_mm. */
+	pgd = (pgd_t *)&kp_swapper_pg_dir[pgd_index(va)];
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return NULL;
 
@@ -162,7 +166,11 @@ static enum kp_leaf_level kp_leaf_of(uint64_t va, uint64_t **out)
 	if (!kp_swapper_pg_dir)
 		return KP_LEAF_NONE;
 
-	pgd = pgd_offset_k(va);
+	/* pgd_offset_k() expands to &init_mm.pgd[...], and init_mm is not an
+	 * exported symbol on this kernel. swapper_pg_dir IS the kernel's top-level
+	 * table, so index it directly: the result is identical, without the
+	 * dependency on init_mm. */
+	pgd = (pgd_t *)&kp_swapper_pg_dir[pgd_index(va)];
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		return KP_LEAF_NONE;
 	p4d = p4d_offset(pgd, va);
