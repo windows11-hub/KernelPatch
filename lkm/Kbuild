@@ -21,6 +21,7 @@ obj-$(CONFIG_KP_LKM) += kernelpatch.o
 
 kernelpatch-objs := \
 	core/init.o \
+	infra/kp_globals.o \
 	infra/symbol_resolver.o \
 	infra/patch_memory.o \
 	infra/sha256.o \
